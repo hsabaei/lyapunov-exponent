@@ -85,6 +85,10 @@ def run(cfg, outdir):
     for col, fname, title in plots:
         fig, ax = plt.subplots(figsize=(8, 4.5))
         ax.plot(df["iteration"], df[col])
+
+        # Prevent misleading scientific-offset notation such as "1e-11 + 2e1"
+        ax.ticklabel_format(axis="y", style="plain", useOffset=False)
+
         ax.set_xlabel("Iteration")
         ax.set_ylabel("Angle (degrees)")
         ax.set_title(f"{cfg.name}: {title}")
