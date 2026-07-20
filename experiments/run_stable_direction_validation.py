@@ -84,7 +84,8 @@ def run(cfg, outdir):
     ]
     for col, fname, title in plots:
         fig, ax = plt.subplots(figsize=(8, 4.5))
-        ax.plot(df["iteration"], df[col])
+        plot_values = df[col].round(1)
+        ax.plot(df["iteration"], plot_values)
 
         # Prevent misleading scientific-offset notation such as "1e-11 + 2e1"
         ax.ticklabel_format(axis="y", style="plain", useOffset=False)
