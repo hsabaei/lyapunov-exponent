@@ -282,7 +282,7 @@ def simulate_nonlinear(
     )
 
     X[0] = x0
-    V[0] = v0
+    V[0] = normalize(v0)
 
     Xtilde[0] = (
         x0
@@ -311,7 +311,16 @@ def simulate_nonlinear(
         if t == steps:
             break
 
-        V[t + 1] = Jx @ V[t]
+        v_next = Jx @ V[t]
+        v_next_norm = np.linalg.norm(v_next)
+
+        if v_next_norm <= EPS:
+            raise RuntimeError(
+                f"Perturbation collapsed numerically at iteration {t + 1}: "
+                f"||v||={v_next_norm:.3e}"
+            )
+
+        V[t + 1] = v_next / v_next_norm
 
         X[t + 1] = map_U(
             X[t],
@@ -423,6 +432,14 @@ def analyze_trial(
         raise RuntimeError(
             f"Non-finite trajectory in trial {trial_id}."
         )
+
+    Utrue = V.copy()
+
+    Uhat, explained = rolling_directions(
+        X=X,
+        L=L,
+        window=cfg.window,
+    )
 
     # Reject trajectories that clearly diverge.
     max_norm = float(np.max(np.linalg.norm(X, axis=1)))
