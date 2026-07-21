@@ -395,9 +395,10 @@ def analyze_trial(
 ) -> pd.DataFrame:
     dim = cfg.dim
 
-    # Keep initial state moderate so the nonlinear map remains
-    # in the basin of attraction of L=0.
-    x0 = 0.75 * normalize(
+    # Start farther from the limit so nonlinear effects are stronger.
+    initial_radius = 2.0
+
+    x0 = initial_radius * normalize(
         rng.normal(size=dim)
     )
 
@@ -418,10 +419,25 @@ def analyze_trial(
         finite_difference_scale=cfg.finite_difference_scale,
     )
 
-    # Fail clearly if the chosen beta / initialization does not converge.
     if not np.isfinite(X).all():
         raise RuntimeError(
             f"Non-finite trajectory in trial {trial_id}."
+        )
+
+    # Reject trajectories that clearly diverge.
+    max_norm = float(np.max(np.linalg.norm(X, axis=1)))
+    final_norm = float(np.linalg.norm(X[-1]))
+
+    if max_norm > 1e4:
+        raise RuntimeError(
+            f"Trial {trial_id} diverged: max ||x_t|| = {max_norm:.3e}"
+        )
+
+    # Require convergence close to L by the end.
+    if final_norm > 1e-4:
+        raise RuntimeError(
+            f"Trial {trial_id} did not converge sufficiently: "
+            f"final ||x_T|| = {final_norm:.3e}"
         )
 
     Utrue = np.array(
@@ -476,11 +492,16 @@ def analyze_trial(
                 Uhat[t - 1],
             )
 
-        finite_delta = (
-            Xtilde[t] - X[t]
+        finite_delta = Xtilde[t] - X[t]
+        delta_norm = np.linalg.norm(finite_delta)
+
+        scale = max(
+            np.linalg.norm(X[t]),
+            np.linalg.norm(Xtilde[t]),
+            1.0,
         )
 
-        if np.linalg.norm(finite_delta) > EPS:
+        if delta_norm > 100.0 * np.finfo(float).eps * scale:
             tangent_vs_finite = angle_deg(
                 Utrue[t],
                 finite_delta,
