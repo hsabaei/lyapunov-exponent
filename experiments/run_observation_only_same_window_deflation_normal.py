@@ -24,9 +24,17 @@ class Config:
     stability_threshold_deg: float = 0.2
     stability_patience: int = 5
 
-    # A selected common window must still contain measurable residual signal.
+    # A selected common window must still contain measurable absolute signal.
+    # This is measured relative to the first observation window.
     relative_window_norm_floor: float = 1e-12
+
+    # A later direction is accepted only if this fraction of the CURRENT
+    # window energy remains before that stage. This is a relative criterion.
     min_residual_energy_fraction: float = 1e-10
+
+    # Purely numerical stopping rule after each window has been normalised
+    # to unit Frobenius norm. This replaces the old absolute-energy EPS test.
+    numeric_relative_residual_floor: float = 1e-15
 
     # Dominance of the extracted direction inside each stage residual.
     min_stage_pc1_energy_fraction: float = 0.80
@@ -156,30 +164,63 @@ def simulate_trajectory(
 def extract_directions_from_same_window(
     error_window: np.ndarray,
     n_directions: int,
+    numeric_relative_residual_floor: float,
 ) -> tuple[list[np.ndarray], list[dict[str, float]]]:
     """
     Sequential deflation inside ONE fixed observation window.
 
-    E^(1) = original error window.
+    First normalise the raw window:
 
-    qhat_1 = dominant right singular vector of E^(1)
-    E^(2) = E^(1) - (E^(1) qhat_1) qhat_1^T
+        E_tilde = E / ||E||_F.
 
-    qhat_2 = dominant right singular vector of E^(2)
-    E^(3) = E^(2) - (E^(2) qhat_2) qhat_2^T
+    Therefore the original normalised-window energy is exactly one.
+    All residual-energy checks below are relative quantities and are
+    independent of the absolute size of the converging trajectory.
 
-    and so on.
+    Stage 1:
+        qhat_1 = dominant right singular vector of E_tilde
+
+        E_tilde^(2)
+        =
+        E_tilde
+        -
+        (E_tilde qhat_1) qhat_1^T
+
+    Stage 2:
+        qhat_2 = dominant right singular vector of E_tilde^(2)
+
+    and similarly for later stages.
+
+    Notes
+    -----
+    * This is mathematically equivalent to obtaining successive right
+      singular vectors of the same window, but the explicit deflation keeps
+      the observation-only construction visible.
+    * The function no longer stops because the RAW trajectory energy falls
+      below a fixed absolute EPS value.
     """
     if error_window.ndim != 2:
         raise ValueError("error_window must be 2-D.")
 
-    original_energy = float(
-        np.linalg.norm(error_window, ord="fro") ** 2
+    raw_window_norm = float(
+        np.linalg.norm(error_window, ord="fro")
     )
-    if original_energy <= EPS:
+
+    if (
+        not np.isfinite(raw_window_norm)
+        or raw_window_norm <= np.finfo(float).tiny
+    ):
         return [], []
 
-    residual = error_window.copy()
+    # Scale-invariant SVD input.
+    normalised_window = error_window / raw_window_norm
+
+    # Up to floating-point error, this is one.
+    original_energy = float(
+        np.linalg.norm(normalised_window, ord="fro") ** 2
+    )
+
+    residual = normalised_window.copy()
     directions: list[np.ndarray] = []
     metrics: list[dict[str, float]] = []
 
@@ -187,7 +228,13 @@ def extract_directions_from_same_window(
         energy_before = float(
             np.linalg.norm(residual, ord="fro") ** 2
         )
-        if energy_before <= EPS:
+
+        # This is a RELATIVE numerical floor because original_energy ~= 1.
+        if (
+            not np.isfinite(energy_before)
+            or energy_before
+            < numeric_relative_residual_floor * original_energy
+        ):
             break
 
         _, singular_values, vt = np.linalg.svd(
@@ -201,14 +248,21 @@ def extract_directions_from_same_window(
             singular_values[0] ** 2 / energy_before
         )
 
-        if len(singular_values) >= 2 and singular_values[1] > EPS:
+        if (
+            len(singular_values) >= 2
+            and singular_values[1]
+            > np.finfo(float).eps
+        ):
             sv_ratio = float(
                 singular_values[0] / singular_values[1]
             )
         else:
             sv_ratio = np.inf
 
-        projection = (residual @ direction)[:, None] * direction[None, :]
+        projection = (
+            (residual @ direction)[:, None]
+            * direction[None, :]
+        )
         residual_after = residual - projection
 
         energy_after = float(
@@ -218,18 +272,26 @@ def extract_directions_from_same_window(
         directions.append(direction)
         metrics.append(
             {
-                "stage_pc1_energy_fraction": stage_pc1_fraction,
-                "singular_value_ratio_1_to_2": sv_ratio,
-                "residual_energy_before_fraction": (
+                "stage_pc1_energy_fraction": (
+                    stage_pc1_fraction
+                ),
+                "singular_value_ratio_1_to_2": (
+                    sv_ratio
+                ),
+                "residual_energy_before_fraction": float(
                     energy_before / original_energy
                 ),
-                "residual_energy_after_fraction": (
+                "residual_energy_after_fraction": float(
                     energy_after / original_energy
                 ),
-                "extracted_energy_fraction_original": (
-                    max(energy_before - energy_after, 0.0)
+                "extracted_energy_fraction_original": float(
+                    max(
+                        energy_before - energy_after,
+                        0.0,
+                    )
                     / original_energy
                 ),
+                "raw_window_fro_norm": raw_window_norm,
             }
         )
 
@@ -278,11 +340,15 @@ def rolling_same_window_diagnostics(
         directions, metrics = extract_directions_from_same_window(
             error_window=error_window,
             n_directions=cfg.n_directions,
+            numeric_relative_residual_floor=(
+                cfg.numeric_relative_residual_floor
+            ),
         )
 
         row: dict = {
             "window_start": window_start,
             "window_end": window_end,
+            "raw_window_fro_norm": current_norm,
             "relative_window_norm": current_norm / first_norm,
             "n_extracted_directions": len(directions),
         }
@@ -820,6 +886,15 @@ def main() -> None:
         default=1e-10,
     )
     parser.add_argument(
+        "--numeric-relative-residual-floor",
+        type=float,
+        default=1e-15,
+        help=(
+            "Purely numerical residual floor after each observation window "
+            "has been normalised to unit Frobenius norm."
+        ),
+    )
+    parser.add_argument(
         "--min-stage-pc1-energy-fraction",
         type=float,
         default=0.80,
@@ -829,7 +904,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=Path(
-            "results/observation_only_same_window_deflation_normal"
+            "results/observation_only_same_window_deflation_normalized"
         ),
     )
 
@@ -846,6 +921,9 @@ def main() -> None:
         stability_patience=args.stability_patience,
         relative_window_norm_floor=args.relative_window_norm_floor,
         min_residual_energy_fraction=args.min_residual_energy_fraction,
+        numeric_relative_residual_floor=(
+            args.numeric_relative_residual_floor
+        ),
         min_stage_pc1_energy_fraction=(
             args.min_stage_pc1_energy_fraction
         ),
@@ -875,7 +953,7 @@ def main() -> None:
     )
 
     print("========================================================")
-    print("Step 3A revised: same-window observation-only deflation")
+    print("Step 3A revised: normalised same-window observation-only deflation")
     print("========================================================")
     print(f"dimension: {cfg.dim}")
     print(f"steps: {cfg.steps}")
@@ -887,6 +965,14 @@ def main() -> None:
     print(
         "minimum residual-energy fraction: "
         f"{cfg.min_residual_energy_fraction:.3e}"
+    )
+    print(
+        "numeric relative residual floor: "
+        f"{cfg.numeric_relative_residual_floor:.3e}"
+    )
+    print(
+        "window normalisation: "
+        "E_tilde = E_t / ||E_t||_F before every SVD"
     )
     print(
         "minimum stage PC1 energy fraction: "
@@ -986,6 +1072,18 @@ def main() -> None:
         "trials": cfg.trials,
         "window": cfg.window,
         "n_directions": cfg.n_directions,
+        "relative_window_norm_floor": (
+            cfg.relative_window_norm_floor
+        ),
+        "min_residual_energy_fraction": (
+            cfg.min_residual_energy_fraction
+        ),
+        "numeric_relative_residual_floor": (
+            cfg.numeric_relative_residual_floor
+        ),
+        "min_stage_pc1_energy_fraction": (
+            cfg.min_stage_pc1_energy_fraction
+        ),
         "common_window_success_rate": float(
             len(successful) / len(all_trials)
         ),
@@ -1045,7 +1143,8 @@ def main() -> None:
     print(
         "\nInterpretation:"
         "\n- One rolling window E_t is selected."
-        "\n- qhat1 is extracted from E_t."
+        "\n- Before SVD, E_t is divided by ||E_t||_F."
+        "\n- qhat1 is extracted from the normalised E_t."
         "\n- qhat1 is removed only from that same E_t."
         "\n- qhat2 is extracted from that same-window residual."
         "\n- qhat2 is removed from the same residual before qhat3."
