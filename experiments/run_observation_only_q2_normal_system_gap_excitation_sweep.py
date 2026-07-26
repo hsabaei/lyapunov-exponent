@@ -21,7 +21,7 @@ REPO_ROOT = SCRIPT_DIR.parent
 
 # Search both the script directory and the repository root. This supports:
 #   repo/experiments/this_script.py
-#   repo/run_observation_only_same_window_deflation_normalized.py
+#   repo/run_observation_only_same_window_deflation_normal.py
 # as well as both files being in experiments/.
 for candidate_dir in (SCRIPT_DIR, REPO_ROOT, REPO_ROOT / "experiments"):
     candidate_text = str(candidate_dir)
@@ -29,7 +29,7 @@ for candidate_dir in (SCRIPT_DIR, REPO_ROOT, REPO_ROOT / "experiments"):
         sys.path.insert(0, candidate_text)
 
 try:
-    from run_observation_only_same_window_deflation_normalized import (
+    from run_observation_only_same_window_deflation_normal import (
         Config as EstimatorConfig,
         angle_deg,
         estimate_from_observations_only,
@@ -39,17 +39,17 @@ try:
 except ImportError as exc:
     searched = [
         SCRIPT_DIR
-        / "run_observation_only_same_window_deflation_normalized.py",
+        / "run_observation_only_same_window_deflation_normal.py",
         REPO_ROOT
-        / "run_observation_only_same_window_deflation_normalized.py",
+        / "run_observation_only_same_window_deflation_normal.py",
         REPO_ROOT
         / "experiments"
-        / "run_observation_only_same_window_deflation_normalized.py",
+        / "run_observation_only_same_window_deflation_normal.py",
     ]
     searched_text = "\n".join(f"  - {path}" for path in searched)
     raise ImportError(
         "Could not import "
-        "'run_observation_only_same_window_deflation_normalized'.\n"
+        "'run_observation_only_same_window_deflation_normal'.\n"
         "Place that file at one of these locations:\n"
         f"{searched_text}"
     ) from exc
