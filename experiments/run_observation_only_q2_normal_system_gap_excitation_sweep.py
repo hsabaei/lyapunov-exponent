@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -15,6 +16,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+
+# Search both the script directory and the repository root. This supports:
+#   repo/experiments/this_script.py
+#   repo/run_observation_only_same_window_deflation_normalized.py
+# as well as both files being in experiments/.
+for candidate_dir in (SCRIPT_DIR, REPO_ROOT, REPO_ROOT / "experiments"):
+    candidate_text = str(candidate_dir)
+    if candidate_text not in sys.path:
+        sys.path.insert(0, candidate_text)
+
 try:
     from run_observation_only_same_window_deflation_normalized import (
         Config as EstimatorConfig,
@@ -24,9 +37,21 @@ try:
         simulate_trajectory,
     )
 except ImportError as exc:
+    searched = [
+        SCRIPT_DIR
+        / "run_observation_only_same_window_deflation_normalized.py",
+        REPO_ROOT
+        / "run_observation_only_same_window_deflation_normalized.py",
+        REPO_ROOT
+        / "experiments"
+        / "run_observation_only_same_window_deflation_normalized.py",
+    ]
+    searched_text = "\n".join(f"  - {path}" for path in searched)
     raise ImportError(
-        "Place this script in the same directory as "
-        "'run_observation_only_same_window_deflation_normalized.py'."
+        "Could not import "
+        "'run_observation_only_same_window_deflation_normalized'.\n"
+        "Place that file at one of these locations:\n"
+        f"{searched_text}"
     ) from exc
 
 
@@ -41,8 +66,11 @@ class SweepConfig:
         0.95,
         0.94,
         0.92,
+        -0.92,
         0.90,
         0.88,
+        -0.88,
+        0.86,
     )
 
     # Controlled magnitude |a2/a1|.
@@ -218,7 +246,7 @@ def build_random_normal_system(
 
     available_tail_max = min(
         cfg.tail_max,
-        lambda2 - cfg.tail_gap_below_lambda2,
+        abs(lambda2) - cfg.tail_gap_below_lambda2,
     )
 
     tail_magnitudes = rng.uniform(
@@ -403,6 +431,7 @@ def analyse_one_trial(
     row = {
         "lambda1": cfg.lambda1,
         "lambda2": lambda2,
+        "lambda2_sign": int(np.sign(lambda2)),
         "spectral_gap_abs": (
             abs(cfg.lambda1) - abs(lambda2)
         ),
@@ -614,8 +643,9 @@ def build_summaries(
         all_trials.groupby(
             [
                 "lambda2",
+                "lambda2_sign",
                 "spectral_gap_abs",
-                "lambda2_over_lambda1",
+                "lambda2_abs_over_lambda1_abs",
                 "excitation_ratio_abs_a2_over_a1",
             ],
             dropna=False,
@@ -634,8 +664,9 @@ def build_summaries(
         all_trials.groupby(
             [
                 "lambda2",
+                "lambda2_sign",
                 "spectral_gap_abs",
-                "lambda2_over_lambda1",
+                "lambda2_abs_over_lambda1_abs",
             ],
             dropna=False,
         )
@@ -677,10 +708,10 @@ def plot_heatmap(
     value_format: str,
 ) -> None:
     pivot = summary.pivot(
-        index="spectral_gap_abs",
+        index="lambda2",
         columns="excitation_ratio_abs_a2_over_a1",
         values=value_column,
-    ).sort_index()
+    ).sort_index(ascending=False)
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -705,7 +736,10 @@ def plot_heatmap(
     )
     ax.set_yticklabels(
         [
-            format_gap_label(float(value))
+            (
+                f"{float(value):+.2f} "
+                f"(gap={float(summary.loc[summary['lambda2'] == value, 'spectral_gap_abs'].iloc[0]):.2f})"
+            )
             for value in pivot.index
         ]
     )
@@ -714,7 +748,7 @@ def plot_heatmap(
         r"Controlled excitation magnitude $|a_2/a_1|$"
     )
     ax.set_ylabel(
-        r"Absolute spectral gap $|\lambda_1|-|\lambda_2|$"
+        r"Signed $\lambda_2$ (magnitude gap in parentheses)"
     )
     ax.set_title(title)
 
@@ -747,19 +781,21 @@ def plot_recovery_vs_excitation(
 ) -> None:
     fig, ax = plt.subplots(figsize=(9, 6))
 
-    for gap, group in summary.groupby(
-        "spectral_gap_abs",
+    for lambda2, group in summary.groupby(
+        "lambda2",
         sort=True,
     ):
         ordered = group.sort_values(
             "excitation_ratio_abs_a2_over_a1"
         )
 
+        gap = float(ordered["spectral_gap_abs"].iloc[0])
+
         ax.plot(
             np.arange(len(ordered)),
             ordered["q2_recovery_rate"],
             marker="o",
-            label=f"gap={gap:.3f}",
+            label=f"lambda2={lambda2:+.2f}, gap={gap:.2f}",
         )
 
     ratios = sorted(
@@ -796,19 +832,27 @@ def plot_recovery_vs_gap(
 ) -> None:
     fig, ax = plt.subplots(figsize=(9, 6))
 
-    for ratio, group in summary.groupby(
-        "excitation_ratio_abs_a2_over_a1",
+    for (ratio, sign), group in summary.groupby(
+        [
+            "excitation_ratio_abs_a2_over_a1",
+            "lambda2_sign",
+        ],
         sort=True,
     ):
         ordered = group.sort_values(
             "spectral_gap_abs"
         )
 
+        sign_label = "positive" if sign > 0 else "negative"
+
         ax.plot(
             ordered["spectral_gap_abs"],
             ordered["q2_recovery_rate"],
             marker="o",
-            label=f"|a2/a1|={ratio:g}",
+            label=(
+                f"|a2/a1|={ratio:g}, "
+                f"lambda2 {sign_label}"
+            ),
         )
 
     ax.set_ylim(-0.02, 1.02)
@@ -835,13 +879,15 @@ def plot_error_vs_excitation(
 ) -> None:
     fig, ax = plt.subplots(figsize=(9, 6))
 
-    for gap, group in summary.groupby(
-        "spectral_gap_abs",
+    for lambda2, group in summary.groupby(
+        "lambda2",
         sort=True,
     ):
         ordered = group.sort_values(
             "excitation_ratio_abs_a2_over_a1"
         )
+
+        gap = float(ordered["spectral_gap_abs"].iloc[0])
 
         ax.plot(
             np.arange(len(ordered)),
@@ -849,7 +895,7 @@ def plot_error_vs_excitation(
                 "median_qhat2_vs_q2_deg_accepted"
             ],
             marker="o",
-            label=f"gap={gap:.3f}",
+            label=f"lambda2={lambda2:+.2f}, gap={gap:.2f}",
         )
 
     ratios = sorted(
@@ -896,7 +942,7 @@ def main() -> None:
         "--lambda2-values",
         type=parse_float_list,
         default=parse_float_list(
-            "0.95,0.94,0.92,0.90,0.88"
+            "0.95,0.94,0.92,-0.92,0.90,0.88,-0.88,0.86"
         ),
     )
     parser.add_argument(
@@ -1052,7 +1098,11 @@ def main() -> None:
     print(f"steps: {cfg.steps}")
     print(f"window: {cfg.window}")
     print(f"lambda1: {cfg.lambda1}")
-    print(f"lambda2 values: {cfg.lambda2_values}")
+    print(f"signed lambda2 values: {cfg.lambda2_values}")
+    print(
+        "All spectral ordering uses magnitudes: "
+        "|lambda1| > |lambda2| > remaining modes"
+    )
     print(
         "controlled |a2/a1| values: "
         f"{cfg.excitation_ratios}"
@@ -1103,7 +1153,7 @@ def main() -> None:
     for lambda2_index, lambda2 in enumerate(
         cfg.lambda2_values
     ):
-        gap = cfg.lambda1 - lambda2
+        gap = abs(cfg.lambda1) - abs(lambda2)
 
         for system_replicate in range(
             cfg.system_replicates
@@ -1130,8 +1180,9 @@ def main() -> None:
                     "lambda1": cfg.lambda1,
                     "lambda2": lambda2,
                     "spectral_gap_abs": gap,
-                    "lambda2_over_lambda1": (
-                        lambda2 / cfg.lambda1
+                    "lambda2_sign": int(np.sign(lambda2)),
+                    "lambda2_abs_over_lambda1_abs": (
+                        abs(lambda2) / abs(cfg.lambda1)
                     ),
                     "system_replicate": (
                         system_replicate
@@ -1189,8 +1240,8 @@ def main() -> None:
                     completed += 1
 
             print(
-                f"completed lambda2={lambda2:.3f}, "
-                f"gap={gap:.3f}, "
+                f"completed lambda2={lambda2:+.3f}, "
+                f"magnitude gap={gap:.3f}, "
                 f"system {system_replicate + 1}/"
                 f"{cfg.system_replicates}; "
                 f"{completed}/{total_trials} trajectories"
