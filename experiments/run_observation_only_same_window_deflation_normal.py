@@ -922,7 +922,7 @@ def plot_angle_errors(
     if data:
         ax.boxplot(
             data,
-            tick_labels=labels,
+            labels=labels,
             showfliers=True,
         )
 
