@@ -1567,6 +1567,291 @@ def plot_aggregate_error_by_angle(
     plt.close(fig)
 
 
+
+
+def _format_percent(rate: float) -> str:
+    if rate is None or not np.isfinite(rate):
+        return "—"
+    return f"{100.0 * rate:.1f}%"
+
+
+def _ordered_angles(frame: pd.DataFrame) -> list[float]:
+    return sorted(
+        [float(value) for value in frame["eigenvector_angle_deg"].unique()],
+        reverse=True,
+    )
+
+
+def _ordered_excitations(frame: pd.DataFrame) -> list[float]:
+    return sorted(
+        [float(value) for value in frame["excitation_ratio_abs_a2_over_a1"].unique()]
+    )
+
+
+def plot_overall_summary_bars(
+    *,
+    overall: pd.Series,
+    output_path: Path,
+) -> None:
+    labels = [
+        "Accepted\n(all trials)",
+        "Recovered\ntrue q2",
+        "Recovered\nq2 perpendicular part",
+        "Recovered\n(q1,q2) plane",
+    ]
+
+    rates = [
+        float(overall["acceptance_rate"]),
+        float(overall["true_q2_recovery_rate_given_q2_present"]),
+        float(overall["qr_compatible_q2_recovery_rate_given_q2_present"]),
+        float(overall["leading_2_subspace_recovery_rate_given_q2_present"]),
+    ]
+
+    counts = [
+        (int(overall["n_accepted"]), int(overall["n_trials"])),
+        (int(overall["n_true_q2_recovered"]), int(overall["n_q2_present_trials"])),
+        (int(overall["n_qr_compatible_q2_recovered"]), int(overall["n_q2_present_trials"])),
+        (int(overall["n_leading_2_subspace_recovered"]), int(overall["n_q2_present_trials"])),
+    ]
+
+    x = np.arange(len(labels))
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    bars = ax.bar(x, [100.0 * value for value in rates], width=0.65)
+
+    ax.set_ylim(0.0, 105.0)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Rate (%)")
+    ax.set_title("Overall summary of accepted and recovered trials")
+    ax.grid(True, axis="y", alpha=0.25)
+
+    for bar, rate, (numerator, denominator) in zip(bars, rates, counts):
+        height = bar.get_height()
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            height + 2.0,
+            f"{100.0 * rate:.2f}%\n({numerator}/{denominator})",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_results_by_angle(
+    *,
+    summary_by_angle: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    frame = summary_by_angle.sort_values(
+        "eigenvector_angle_deg", ascending=False
+    ).copy()
+
+    x = frame["eigenvector_angle_deg"].to_numpy(dtype=float)
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    ax.plot(
+        x,
+        100.0 * frame["acceptance_rate"].to_numpy(dtype=float),
+        marker="o",
+        label="Accepted by observation criteria",
+    )
+    ax.plot(
+        x,
+        100.0 * frame[
+            "true_q2_recovery_rate_given_q2_present"
+        ].to_numpy(dtype=float),
+        marker="o",
+        label="Recovered true q2",
+    )
+    ax.plot(
+        x,
+        100.0 * frame[
+            "qr_compatible_q2_recovery_rate_given_q2_present"
+        ].to_numpy(dtype=float),
+        marker="o",
+        label="Recovered q2 perpendicular part",
+    )
+    ax.plot(
+        x,
+        100.0 * frame[
+            "leading_2_subspace_recovery_rate_given_q2_present"
+        ].to_numpy(dtype=float),
+        marker="o",
+        label="Recovered (q1,q2) plane",
+    )
+
+    ax.set_xticks(x)
+    ax.set_ylim(0.0, 105.0)
+    ax.set_xlabel(r"Angle between $q_1$ and $q_2$ (degrees)")
+    ax.set_ylabel("Rate (%)")
+    ax.set_title("Results by angle between the first two true eigendirections")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_true_q2_error_relationship(
+    *,
+    summary_by_angle: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    frame = summary_by_angle.sort_values(
+        "eigenvector_angle_deg", ascending=False
+    ).copy()
+
+    angle = frame["eigenvector_angle_deg"].to_numpy(dtype=float)
+    observed_true_error = frame[
+        "median_qhat2_vs_true_q2_deg_accepted"
+    ].to_numpy(dtype=float)
+    observed_qr_error = frame[
+        "median_qhat2_vs_qr_compatible_q2_deg_accepted"
+    ].to_numpy(dtype=float)
+    expected_true_error = 90.0 - angle
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    ax.plot(
+        angle,
+        observed_true_error,
+        marker="o",
+        label=r"Median $\angle(\hat u_2,q_2)$",
+    )
+    ax.plot(
+        angle,
+        expected_true_error,
+        linestyle="--",
+        marker="o",
+        label=r"Expected $90^\circ-\theta$",
+    )
+    ax.plot(
+        angle,
+        observed_qr_error,
+        marker="o",
+        label=r"Median $\angle(\hat u_2,q_{2,\perp})$",
+    )
+
+    ax.set_xticks(angle)
+    ax.set_xlabel(r"Angle between $q_1$ and $q_2$ (degrees)")
+    ax.set_ylabel("Median angular error (degrees)")
+    ax.set_title("The estimated second direction follows the perpendicular part of q2")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_simple_heatmap(
+    *,
+    matrix: pd.DataFrame,
+    title: str,
+    colourbar_label: str,
+    output_path: Path,
+    value_format: str = ".2f",
+    as_percent: bool = True,
+) -> None:
+    plot_values = matrix.to_numpy(dtype=float)
+    show_values = 100.0 * plot_values if as_percent else plot_values
+
+    fig_height = max(4.5, 0.75 * len(matrix.index) + 1.8)
+    fig, ax = plt.subplots(figsize=(8.5, fig_height))
+
+    image = ax.imshow(show_values, aspect="auto", origin="upper")
+
+    ax.set_xticks(np.arange(len(matrix.columns)))
+    ax.set_xticklabels([f"{float(value):g}" for value in matrix.columns])
+    ax.set_yticks(np.arange(len(matrix.index)))
+    ax.set_yticklabels([f"{float(value):.0f}" for value in matrix.index])
+    ax.set_xlabel(r"Controlled excitation $|a_2/a_1|$")
+    ax.set_ylabel(r"Angle between $q_1$ and $q_2$ (degrees)")
+    ax.set_title(title)
+
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            value = show_values[i, j]
+            if np.isfinite(value):
+                ax.text(
+                    j,
+                    i,
+                    format(value, value_format),
+                    ha="center",
+                    va="center",
+                    fontsize=10,
+                )
+            else:
+                ax.text(
+                    j,
+                    i,
+                    "—",
+                    ha="center",
+                    va="center",
+                    fontsize=10,
+                )
+
+    cbar = fig.colorbar(image, ax=ax)
+    cbar.set_label(colourbar_label)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_angle_excitation_recovery_heatmap(
+    *,
+    all_trials: pd.DataFrame,
+    metric_column: str,
+    title: str,
+    colourbar_label: str,
+    output_path: Path,
+    require_q2_present: bool,
+) -> None:
+    if require_q2_present:
+        frame = all_trials[all_trials["q2_present_in_trajectory"]].copy()
+    else:
+        frame = all_trials.copy()
+
+    grouped = (
+        frame.groupby(
+            ["eigenvector_angle_deg", "excitation_ratio_abs_a2_over_a1"],
+            dropna=False,
+        )[metric_column]
+        .mean()
+        .reset_index()
+    )
+
+    angle_order = _ordered_angles(frame)
+    excitation_order = _ordered_excitations(frame)
+
+    pivot = grouped.pivot(
+        index="eigenvector_angle_deg",
+        columns="excitation_ratio_abs_a2_over_a1",
+        values=metric_column,
+    )
+    pivot = pivot.reindex(index=angle_order, columns=excitation_order)
+
+    if require_q2_present and 0.0 in pivot.columns:
+        pivot.loc[:, 0.0] = np.nan
+
+    plot_simple_heatmap(
+        matrix=pivot,
+        title=title,
+        colourbar_label=colourbar_label,
+        output_path=output_path,
+        value_format=".0f",
+        as_percent=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -2008,6 +2293,10 @@ def main() -> None:
         trial_rows
     )
 
+    all_trials["acceptance_rate_placeholder"] = all_trials[
+        "accepted_by_observation_criteria"
+    ].astype(float)
+
     all_trials.to_csv(
         output / "all_trial_metrics.csv",
         index=False,
@@ -2045,145 +2334,56 @@ def main() -> None:
         / "summary_by_lambda_and_angle.csv",
         index=False,
     )
-
-    plot_heatmap(
-        summary_by_cell=(
-            summary_by_cell
-        ),
-        value_column=(
-            "true_q2_recovery_rate_given_q2_present"
-        ),
-        title=(
-            "Recovery rate of the true second right eigenvector"
-        ),
-        colourbar_label=(
-            "true q2 recovery rate"
-        ),
+    plot_overall_summary_bars(
+        overall=summarise_group(all_trials),
         output_path=(
-            output
-            / "01_true_q2_recovery_rate_heatmap.png"
+            output / "01_overall_summary_rates.png"
         ),
-        value_format=".2f",
     )
 
-    plot_heatmap(
-        summary_by_cell=(
-            summary_by_cell
-        ),
-        value_column=(
-            "leading_2_subspace_recovery_rate_given_q2_present"
-        ),
-        title=(
-            "Recovery rate of the leading two-dimensional "
-            "invariant subspace"
-        ),
-        colourbar_label=(
-            "leading 2D subspace recovery rate"
-        ),
+    plot_results_by_angle(
+        summary_by_angle=summary_by_angle,
         output_path=(
-            output
-            / "02_leading_2_subspace_recovery_rate_heatmap.png"
+            output / "02_results_by_angle.png"
         ),
-        value_format=".2f",
     )
 
-    plot_heatmap(
-        summary_by_cell=(
-            summary_by_cell
-        ),
-        value_column=(
-            "qr_compatible_q2_recovery_rate_given_q2_present"
-        ),
-        title=(
-            "Recovery rate of the QR-compatible second direction"
-        ),
-        colourbar_label=(
-            "QR-compatible q2 recovery rate"
-        ),
+    plot_true_q2_error_relationship(
+        summary_by_angle=summary_by_angle,
         output_path=(
-            output
-            / "03_qr_compatible_q2_recovery_rate_heatmap.png"
+            output / "03_true_q2_error_vs_angle.png"
         ),
-        value_format=".2f",
     )
 
-    plot_heatmap(
-        summary_by_cell=(
-            summary_by_cell
-        ),
-        value_column="acceptance_rate",
-        title=(
-            "Observation-based common-window acceptance rate"
-        ),
-        colourbar_label=(
-            "acceptance rate"
-        ),
-        output_path=(
-            output
-            / "04_acceptance_rate_heatmap.png"
-        ),
-        value_format=".2f",
-    )
-
-    plot_heatmap(
-        summary_by_cell=(
-            summary_by_cell
-        ),
-        value_column=(
-            "median_qhat2_vs_true_q2_deg_accepted"
-        ),
-        title=(
-            "Median qhat2 error relative to the true q2 "
-            "among accepted trials"
-        ),
-        colourbar_label=(
-            "median true-q2 error (degrees)"
-        ),
-        output_path=(
-            output
-            / "05_median_true_q2_error_heatmap.png"
-        ),
-        value_format=".2f",
-    )
-
-    plot_heatmap(
-        summary_by_cell=(
-            summary_by_cell
-        ),
-        value_column=(
-            "median_leading_2_subspace_error_deg_accepted"
-        ),
-        title=(
-            "Median leading-two-subspace error "
-            "among accepted trials"
-        ),
-        colourbar_label=(
-            "median subspace error (degrees)"
-        ),
-        output_path=(
-            output
-            / "06_median_subspace_error_heatmap.png"
-        ),
-        value_format=".3f",
-    )
-
-    plot_aggregate_recovery_by_angle(
+    plot_angle_excitation_recovery_heatmap(
         all_trials=all_trials,
-        output_path=(
-            output
-            / "07_recovery_targets_vs_eigenvector_angle.png"
-        ),
+        metric_column="acceptance_rate_placeholder",
+        title="Observation-only acceptance rate by angle and excitation",
+        colourbar_label="acceptance rate (%)",
+        output_path=(output / "04_acceptance_by_angle_and_excitation.png"),
+        require_q2_present=False,
     )
 
-    plot_aggregate_error_by_angle(
+    plot_angle_excitation_recovery_heatmap(
         all_trials=all_trials,
-        output_path=(
-            output
-            / "08_errors_vs_eigenvector_angle.png"
-        ),
+        metric_column="q2_true_recovered_within_tolerance",
+        title="True q2 recovery by angle and excitation",
+        colourbar_label="true q2 recovery rate (%)",
+        output_path=(output / "05_true_q2_recovery_by_angle_and_excitation.png"),
+        require_q2_present=True,
+    )
+
+    plot_angle_excitation_recovery_heatmap(
+        all_trials=all_trials,
+        metric_column="q2_qr_compatible_recovered_within_tolerance",
+        title="Recovery of the perpendicular part of q2 by angle and excitation",
+        colourbar_label="q2 perpendicular-part recovery rate (%)",
+        output_path=(output / "06_q2_perpendicular_recovery_by_angle_and_excitation.png"),
+        require_q2_present=True,
     )
 
     overall = summarise_group(
+
         all_trials
     )
     overall_frame = (
