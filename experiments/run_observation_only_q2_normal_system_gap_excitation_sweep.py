@@ -925,6 +925,558 @@ def plot_error_vs_excitation(
     plt.close(fig)
 
 
+
+def add_bar_annotations(
+    ax: plt.Axes,
+    bars: Iterable,
+    percentages: Iterable[float],
+    counts: Iterable[int] | None = None,
+) -> None:
+    percentages = list(percentages)
+    counts_list = list(counts) if counts is not None else None
+
+    for index, (bar, percentage) in enumerate(
+        zip(bars, percentages)
+    ):
+        label = f"{percentage:.2f}%"
+
+        if counts_list is not None:
+            label += f"\n(n={counts_list[index]:,})"
+
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height() + 1.5,
+            label,
+            ha="center",
+            va="bottom",
+        )
+
+
+def plot_overall_trial_outcomes(
+    all_trials: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """
+    Mutually exclusive outcomes across all trajectories.
+
+    This plot makes the difference between observation-based acceptance and
+    validated q2 recovery explicit.
+    """
+    total = int(len(all_trials))
+    accepted = int(
+        all_trials[
+            "accepted_by_observation_criteria"
+        ].sum()
+    )
+    recovered = int(
+        all_trials[
+            "q2_recovered_within_tolerance"
+        ].sum()
+    )
+
+    accepted_not_q2 = accepted - recovered
+    rejected = total - accepted
+
+    labels = [
+        r"Recovered $q_2$",
+        "Accepted,\nbut not $q_2$",
+        "No accepted\npair",
+    ]
+    counts = [
+        recovered,
+        accepted_not_q2,
+        rejected,
+    ]
+    percentages = [
+        100.0 * count / total
+        for count in counts
+    ]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    bars = ax.bar(labels, percentages)
+
+    ax.set_ylim(0.0, 105.0)
+    ax.set_ylabel("Percentage of all trajectories")
+    ax.set_title(
+        "Overall outcomes of the two-direction estimator"
+    )
+    ax.grid(True, axis="y", alpha=0.25)
+
+    add_bar_annotations(
+        ax=ax,
+        bars=bars,
+        percentages=percentages,
+        counts=counts,
+    )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_zero_excitation_control(
+    all_trials: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """
+    Show that an accepted stable residual direction is not necessarily q2
+    when a2=0 and q2 is absent from the observed trajectory.
+    """
+    zero = all_trials[
+        np.isclose(
+            all_trials[
+                "excitation_ratio_abs_a2_over_a1"
+            ].to_numpy(dtype=float),
+            0.0,
+        )
+    ]
+
+    total = int(len(zero))
+    accepted = int(
+        zero[
+            "accepted_by_observation_criteria"
+        ].sum()
+    )
+    recovered = int(
+        zero[
+            "q2_recovered_within_tolerance"
+        ].sum()
+    )
+
+    labels = [
+        "Accepted stable\nsecond direction",
+        r"Recovered $q_2$",
+    ]
+    counts = [accepted, recovered]
+    percentages = [
+        100.0 * count / total
+        if total > 0
+        else np.nan
+        for count in counts
+    ]
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    bars = ax.bar(labels, percentages)
+
+    ax.set_ylim(0.0, 105.0)
+    ax.set_ylabel(
+        r"Percentage of trajectories with $a_2=0$"
+    )
+    ax.set_title(
+        r"Negative control: $q_2$ is absent when $a_2=0$"
+    )
+    ax.grid(True, axis="y", alpha=0.25)
+
+    add_bar_annotations(
+        ax=ax,
+        bars=bars,
+        percentages=percentages,
+        counts=counts,
+    )
+
+    ax.text(
+        0.5,
+        -0.20,
+        (
+            "Acceptance can correspond to another lower "
+            "residual direction."
+        ),
+        transform=ax.transAxes,
+        ha="center",
+    )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_overall_rates_vs_excitation(
+    summary: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """
+    Aggregate over all tested signed lambda2 values and system replicates.
+    """
+    ordered = summary.sort_values(
+        "excitation_ratio_abs_a2_over_a1"
+    )
+
+    x = np.arange(len(ordered))
+    ratios = ordered[
+        "excitation_ratio_abs_a2_over_a1"
+    ].to_numpy(dtype=float)
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    ax.plot(
+        x,
+        100.0 * ordered["acceptance_rate"],
+        marker="o",
+        label="Accepted pair",
+    )
+    ax.plot(
+        x,
+        100.0 * ordered["q2_recovery_rate"],
+        marker="o",
+        label=r"Recovered $q_2$",
+    )
+
+    ax.set_xticks(
+        x,
+        [
+            format_ratio_label(value)
+            for value in ratios
+        ],
+    )
+    ax.set_ylim(0.0, 105.0)
+    ax.set_xlabel(
+        r"Controlled excitation magnitude $|a_2/a_1|$"
+    )
+    ax.set_ylabel("Percentage of trajectories")
+    ax.set_title(
+        r"Effect of the initial $q_2$ component"
+    )
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_positive_lambda2_gap_heatmap(
+    summary: pd.DataFrame,
+    cfg: SweepConfig,
+    output_path: Path,
+) -> None:
+    """
+    Isolate positive lambda2 values so that the magnitude-gap effect is not
+    mixed with the alternating-sign effect.
+    """
+    positive = summary[
+        summary["lambda2"] > 0.0
+    ].copy()
+
+    row_order = (
+        positive[
+            ["lambda2", "spectral_gap_abs"]
+        ]
+        .drop_duplicates()
+        .sort_values("spectral_gap_abs")
+    )
+
+    lambda2_order = row_order[
+        "lambda2"
+    ].to_list()
+
+    excitation_order = list(
+        cfg.excitation_ratios
+    )
+
+    pivot = (
+        positive.pivot(
+            index="lambda2",
+            columns="excitation_ratio_abs_a2_over_a1",
+            values="q2_recovery_rate",
+        )
+        .reindex(
+            index=lambda2_order,
+            columns=excitation_order,
+        )
+    )
+
+    values = 100.0 * pivot.to_numpy(dtype=float)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    image = ax.imshow(
+        values,
+        aspect="auto",
+        origin="upper",
+        vmin=0.0,
+        vmax=100.0,
+    )
+
+    ax.set_xticks(
+        np.arange(len(excitation_order)),
+        [
+            format_ratio_label(value)
+            for value in excitation_order
+        ],
+    )
+
+    y_labels = []
+    for lambda2 in lambda2_order:
+        gap = abs(cfg.lambda1) - abs(lambda2)
+        y_labels.append(
+            rf"$\lambda_2={lambda2:.2f}$  "
+            rf"(gap={gap:.2f})"
+        )
+
+    ax.set_yticks(
+        np.arange(len(lambda2_order)),
+        y_labels,
+    )
+
+    ax.set_xlabel(
+        r"Controlled excitation magnitude $|a_2/a_1|$"
+    )
+    ax.set_ylabel(
+        r"Positive $\lambda_2$ and magnitude gap"
+    )
+    ax.set_title(
+        "Recovery across excitation and eigenvalue-magnitude gap"
+    )
+
+    for row_index in range(values.shape[0]):
+        for column_index in range(values.shape[1]):
+            value = values[row_index, column_index]
+
+            if np.isfinite(value):
+                ax.text(
+                    column_index,
+                    row_index,
+                    f"{value:.0f}%",
+                    ha="center",
+                    va="center",
+                )
+
+    colourbar = fig.colorbar(image, ax=ax)
+    colourbar.set_label(r"$q_2$ recovery rate (%)")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_sign_effect_for_magnitude(
+    summary: pd.DataFrame,
+    magnitude: float,
+    output_path: Path,
+) -> None:
+    """
+    Directly compare +|lambda2| and -|lambda2| at matched excitation levels.
+    """
+    selected = summary[
+        np.isclose(
+            np.abs(
+                summary["lambda2"].to_numpy(dtype=float)
+            ),
+            magnitude,
+        )
+    ].copy()
+
+    if selected.empty:
+        return
+
+    ratios = sorted(
+        selected[
+            "excitation_ratio_abs_a2_over_a1"
+        ].unique()
+    )
+    x = np.arange(len(ratios))
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    for lambda2 in (magnitude, -magnitude):
+        group = selected[
+            np.isclose(
+                selected["lambda2"].to_numpy(dtype=float),
+                lambda2,
+            )
+        ].sort_values(
+            "excitation_ratio_abs_a2_over_a1"
+        )
+
+        if group.empty:
+            continue
+
+        ax.plot(
+            x,
+            100.0 * group["q2_recovery_rate"],
+            marker="o",
+            label=rf"$\lambda_2={lambda2:+.2f}$",
+        )
+
+    ax.set_xticks(
+        x,
+        [
+            format_ratio_label(value)
+            for value in ratios
+        ],
+    )
+    ax.set_ylim(0.0, 105.0)
+    ax.set_xlabel(
+        r"Controlled excitation magnitude $|a_2/a_1|$"
+    )
+    ax.set_ylabel(r"$q_2$ recovery rate (%)")
+    ax.set_title(
+        rf"Effect of the sign of $\lambda_2$ "
+        rf"when $|\lambda_2|={magnitude:.2f}$"
+    )
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_accepted_q2_errors_by_excitation(
+    all_trials: pd.DataFrame,
+    cfg: SweepConfig,
+    output_path: Path,
+) -> None:
+    """
+    Show the distribution of validation errors among estimates that passed
+    the observation-only acceptance criteria.
+    """
+    accepted = all_trials[
+        all_trials[
+            "accepted_by_observation_criteria"
+        ]
+    ]
+
+    labels: list[str] = []
+    data: list[np.ndarray] = []
+
+    for ratio in cfg.excitation_ratios:
+        values = accepted.loc[
+            np.isclose(
+                accepted[
+                    "excitation_ratio_abs_a2_over_a1"
+                ].to_numpy(dtype=float),
+                ratio,
+            ),
+            "qhat2_vs_q2_deg",
+        ].dropna().to_numpy(dtype=float)
+
+        if len(values) == 0:
+            continue
+
+        labels.append(format_ratio_label(ratio))
+        data.append(
+            np.maximum(values, 1e-8)
+        )
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    if data:
+        ax.boxplot(
+            data,
+            labels=labels,
+            showfliers=False,
+        )
+        ax.set_yscale("log")
+
+    ax.axhline(
+        cfg.recovery_angle_tolerance_deg,
+        linestyle="--",
+        label=(
+            f"{cfg.recovery_angle_tolerance_deg:g}° "
+            "recovery threshold"
+        ),
+    )
+
+    ax.set_xlabel(
+        r"Controlled excitation magnitude $|a_2/a_1|$"
+    )
+    ax.set_ylabel(
+        r"Angle between $\widehat u_2$ and $q_2$ "
+        "(degrees, log scale)"
+    )
+    ax.set_title(
+        "Accuracy among observation-based accepted estimates"
+    )
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def save_presentation_plot_summary(
+    all_trials: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    total = int(len(all_trials))
+    accepted = int(
+        all_trials[
+            "accepted_by_observation_criteria"
+        ].sum()
+    )
+    recovered = int(
+        all_trials[
+            "q2_recovered_within_tolerance"
+        ].sum()
+    )
+
+    zero = all_trials[
+        np.isclose(
+            all_trials[
+                "excitation_ratio_abs_a2_over_a1"
+            ].to_numpy(dtype=float),
+            0.0,
+        )
+    ]
+    zero_total = int(len(zero))
+    zero_accepted = int(
+        zero[
+            "accepted_by_observation_criteria"
+        ].sum()
+    )
+    zero_recovered = int(
+        zero[
+            "q2_recovered_within_tolerance"
+        ].sum()
+    )
+
+    rows = [
+        {
+            "result": "all_accepted",
+            "count": accepted,
+            "denominator": total,
+            "rate": accepted / total,
+        },
+        {
+            "result": "all_q2_recovered",
+            "count": recovered,
+            "denominator": total,
+            "rate": recovered / total,
+        },
+        {
+            "result": "accepted_but_not_q2",
+            "count": accepted - recovered,
+            "denominator": total,
+            "rate": (accepted - recovered) / total,
+        },
+        {
+            "result": "zero_excitation_accepted",
+            "count": zero_accepted,
+            "denominator": zero_total,
+            "rate": (
+                zero_accepted / zero_total
+                if zero_total > 0
+                else np.nan
+            ),
+        },
+        {
+            "result": "zero_excitation_q2_recovered",
+            "count": zero_recovered,
+            "denominator": zero_total,
+            "rate": (
+                zero_recovered / zero_total
+                if zero_total > 0
+                else np.nan
+            ),
+        },
+    ]
+
+    pd.DataFrame(rows).to_csv(
+        output_path,
+        index=False,
+    )
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -1279,6 +1831,72 @@ def main() -> None:
         index=False,
     )
 
+    # ------------------------------------------------------------
+    # Presentation-ready plots
+    # ------------------------------------------------------------
+    plot_overall_trial_outcomes(
+        all_trials=all_trials,
+        output_path=(
+            output / "01_overall_trial_outcomes.png"
+        ),
+    )
+
+    plot_zero_excitation_control(
+        all_trials=all_trials,
+        output_path=(
+            output / "02_zero_excitation_negative_control.png"
+        ),
+    )
+
+    plot_overall_rates_vs_excitation(
+        summary=summary_by_excitation,
+        output_path=(
+            output / "03_acceptance_and_recovery_vs_excitation.png"
+        ),
+    )
+
+    plot_positive_lambda2_gap_heatmap(
+        summary=summary_by_cell,
+        cfg=cfg,
+        output_path=(
+            output / "04_positive_lambda2_gap_effect.png"
+        ),
+    )
+
+    plot_sign_effect_for_magnitude(
+        summary=summary_by_cell,
+        magnitude=0.88,
+        output_path=(
+            output / "05_sign_effect_abs_lambda2_088.png"
+        ),
+    )
+
+    plot_sign_effect_for_magnitude(
+        summary=summary_by_cell,
+        magnitude=0.92,
+        output_path=(
+            output / "06_sign_effect_abs_lambda2_092.png"
+        ),
+    )
+
+    plot_accepted_q2_errors_by_excitation(
+        all_trials=all_trials,
+        cfg=cfg,
+        output_path=(
+            output / "07_accepted_q2_error_by_excitation.png"
+        ),
+    )
+
+    save_presentation_plot_summary(
+        all_trials=all_trials,
+        output_path=(
+            output / "presentation_plot_summary.csv"
+        ),
+    )
+
+    # ------------------------------------------------------------
+    # Existing detailed diagnostic plots retained as appendix plots
+    # ------------------------------------------------------------
     plot_heatmap(
         summary=summary_by_cell,
         value_column="q2_recovery_rate",
@@ -1287,7 +1905,7 @@ def main() -> None:
         ),
         colourbar_label="q2 recovery rate",
         output_path=(
-            output / "01_q2_recovery_rate_heatmap.png"
+            output / "appendix_01_q2_recovery_rate_heatmap.png"
         ),
         value_format=".2f",
     )
@@ -1300,7 +1918,7 @@ def main() -> None:
         ),
         colourbar_label="acceptance rate",
         output_path=(
-            output / "02_acceptance_rate_heatmap.png"
+            output / "appendix_02_acceptance_rate_heatmap.png"
         ),
         value_format=".2f",
     )
@@ -1316,7 +1934,7 @@ def main() -> None:
         ),
         colourbar_label="median q2 error (degrees)",
         output_path=(
-            output / "03_median_q2_error_heatmap.png"
+            output / "appendix_03_median_q2_error_heatmap.png"
         ),
         value_format=".3f",
     )
@@ -1325,7 +1943,7 @@ def main() -> None:
         summary=summary_by_cell,
         output_path=(
             output
-            / "04_q2_recovery_rate_vs_excitation.png"
+            / "appendix_04_q2_recovery_rate_vs_excitation.png"
         ),
     )
 
@@ -1333,7 +1951,7 @@ def main() -> None:
         summary=summary_by_cell,
         output_path=(
             output
-            / "05_q2_recovery_rate_vs_spectral_gap.png"
+            / "appendix_05_q2_recovery_rate_vs_spectral_gap.png"
         ),
     )
 
@@ -1341,7 +1959,7 @@ def main() -> None:
         summary=summary_by_cell,
         output_path=(
             output
-            / "06_median_q2_error_vs_excitation.png"
+            / "appendix_06_median_q2_error_vs_excitation.png"
         ),
     )
 
