@@ -39,6 +39,9 @@ class Config:
     # Dominance of the extracted direction inside each stage residual.
     min_stage_pc1_energy_fraction: float = 0.80
 
+    # Used only for synthetic validation plots.
+    recovery_tolerance_deg: float = 1.0
+
 
 def normalize(v: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(v))
@@ -483,6 +486,180 @@ def select_common_window(
     return diagnostics.iloc[selected_index], len(candidates)
 
 
+
+def prefix_window_is_stable(
+    recent: pd.DataFrame,
+    cfg: Config,
+    n_stages: int,
+) -> bool:
+    """
+    Check whether the first ``n_stages`` directions are simultaneously
+    stable and supported in the same rolling window sequence.
+
+    This is used only to produce stage-wise result summaries:
+      stage 1: qhat1 is supported,
+      stage 2: qhat1 and qhat2 are supported together,
+      stage 3: qhat1, qhat2, and qhat3 are supported together.
+    """
+    if recent.empty:
+        return False
+
+    last = recent.iloc[-1]
+
+    if (
+        float(last["relative_window_norm"])
+        < cfg.relative_window_norm_floor
+    ):
+        return False
+
+    for stage in range(1, n_stages + 1):
+        changes = recent[
+            f"stage_{stage}_direction_change_deg"
+        ].to_numpy(dtype=float)
+
+        finite_changes = changes[np.isfinite(changes)]
+
+        if len(finite_changes) < cfg.stability_patience - 1:
+            return False
+
+        if not np.all(
+            finite_changes <= cfg.stability_threshold_deg
+        ):
+            return False
+
+        pc1 = recent[
+            f"stage_{stage}_stage_pc1_energy_fraction"
+        ].to_numpy(dtype=float)
+
+        if not np.all(np.isfinite(pc1)):
+            return False
+
+        if not np.all(
+            pc1 >= cfg.min_stage_pc1_energy_fraction
+        ):
+            return False
+
+        residual_before = recent[
+            f"stage_{stage}_residual_energy_before_fraction"
+        ].to_numpy(dtype=float)
+
+        if not np.all(np.isfinite(residual_before)):
+            return False
+
+        if not np.all(
+            residual_before >= cfg.min_residual_energy_fraction
+        ):
+            return False
+
+    return True
+
+
+def select_prefix_window(
+    diagnostics: pd.DataFrame,
+    cfg: Config,
+    n_stages: int,
+) -> tuple[pd.Series | None, int]:
+    """
+    Select the latest window supporting the first ``n_stages`` directions.
+
+    The selected window may differ by stage. Therefore, this stage-wise
+    analysis must not be confused with the stricter all-three-common-window
+    result produced by ``select_common_window``.
+    """
+    candidates: list[int] = []
+
+    for i in range(len(diagnostics)):
+        if i < cfg.stability_patience - 1:
+            continue
+
+        recent = diagnostics.iloc[
+            i - cfg.stability_patience + 1 : i + 1
+        ]
+
+        if prefix_window_is_stable(
+            recent=recent,
+            cfg=cfg,
+            n_stages=n_stages,
+        ):
+            candidates.append(i)
+
+    if not candidates:
+        return None, 0
+
+    selected_index = candidates[-1]
+    return diagnostics.iloc[selected_index], len(candidates)
+
+
+def evaluate_stagewise_extraction(
+    diagnostics: pd.DataFrame,
+    true_basis: np.ndarray,
+    x0: np.ndarray,
+    cfg: Config,
+) -> dict:
+    """
+    Evaluate each direction at the latest window that supports the first
+    1, 2, or 3 directions, respectively.
+
+    These outputs are intended for clear result plots:
+      - how often each direction can be extracted,
+      - angular error when it is extracted,
+      - relation to the initial component magnitude.
+    """
+    result: dict = {}
+
+    for stage in range(1, cfg.n_directions + 1):
+        selected, n_candidates = select_prefix_window(
+            diagnostics=diagnostics,
+            cfg=cfg,
+            n_stages=stage,
+        )
+
+        result[f"stage_{stage}_n_stable_candidates"] = int(
+            n_candidates
+        )
+        result[f"abs_initial_component_q{stage}"] = abs(
+            float(
+                x0 @ normalize(true_basis[:, stage - 1])
+            )
+        )
+
+        if selected is None:
+            result[f"stage_{stage}_extraction_success"] = False
+            result[f"stage_{stage}_window_start"] = np.nan
+            result[f"stage_{stage}_window_end"] = np.nan
+            result[f"stage_{stage}_angle_error_deg"] = np.nan
+            result[f"stage_{stage}_recovered"] = False
+            continue
+
+        direction = selected[f"direction_{stage}"]
+
+        if direction is None:
+            result[f"stage_{stage}_extraction_success"] = False
+            result[f"stage_{stage}_window_start"] = np.nan
+            result[f"stage_{stage}_window_end"] = np.nan
+            result[f"stage_{stage}_angle_error_deg"] = np.nan
+            result[f"stage_{stage}_recovered"] = False
+            continue
+
+        error = angle_deg(
+            normalize(direction),
+            true_basis[:, stage - 1],
+        )
+
+        result[f"stage_{stage}_extraction_success"] = True
+        result[f"stage_{stage}_window_start"] = int(
+            selected["window_start"]
+        )
+        result[f"stage_{stage}_window_end"] = int(
+            selected["window_end"]
+        )
+        result[f"stage_{stage}_angle_error_deg"] = float(error)
+        result[f"stage_{stage}_recovered"] = bool(
+            error <= cfg.recovery_tolerance_deg
+        )
+
+    return result
+
 def estimate_from_observations_only(
     X: np.ndarray,
     L: np.ndarray,
@@ -583,6 +760,13 @@ def analyse_trial(
         cfg=cfg,
     )
 
+    stagewise_metrics = evaluate_stagewise_extraction(
+        diagnostics=diagnostics,
+        true_basis=true_basis,
+        x0=x0,
+        cfg=cfg,
+    )
+
     row: dict = {
         "trial": trial_id,
         "success": bool(info["success"]),
@@ -597,6 +781,7 @@ def analyse_trial(
             0,
         ),
     }
+    row.update(stagewise_metrics)
 
     if len(directions) == cfg.n_directions:
         estimated_basis = np.column_stack(directions)
@@ -751,6 +936,308 @@ def plot_angle_errors(
     plt.close(fig)
 
 
+
+def summarise_stagewise_extraction(
+    all_trials: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
+    rows: list[dict] = []
+
+    for stage in range(1, cfg.n_directions + 1):
+        success = all_trials[
+            f"stage_{stage}_extraction_success"
+        ].astype(bool)
+
+        recovered = all_trials[
+            f"stage_{stage}_recovered"
+        ].astype(bool)
+
+        errors = all_trials.loc[
+            success,
+            f"stage_{stage}_angle_error_deg",
+        ].dropna()
+
+        n_success = int(success.sum())
+        n_recovered = int(recovered.sum())
+
+        rows.append(
+            {
+                "stage": stage,
+                "direction": f"q{stage}",
+                "n_trials": int(len(all_trials)),
+                "n_extracted": n_success,
+                "extraction_success_rate": float(
+                    n_success / len(all_trials)
+                ),
+                "n_recovered_within_tolerance": n_recovered,
+                "recovery_rate_all_trials": float(
+                    n_recovered / len(all_trials)
+                ),
+                "recovery_rate_given_extracted": (
+                    float(n_recovered / n_success)
+                    if n_success > 0
+                    else np.nan
+                ),
+                "recovery_tolerance_deg": (
+                    cfg.recovery_tolerance_deg
+                ),
+                "median_angle_error_deg": (
+                    float(errors.median())
+                    if not errors.empty
+                    else np.nan
+                ),
+                "q25_angle_error_deg": (
+                    float(errors.quantile(0.25))
+                    if not errors.empty
+                    else np.nan
+                ),
+                "q75_angle_error_deg": (
+                    float(errors.quantile(0.75))
+                    if not errors.empty
+                    else np.nan
+                ),
+                "median_selected_window_end": (
+                    float(
+                        all_trials.loc[
+                            success,
+                            f"stage_{stage}_window_end",
+                        ].median()
+                    )
+                    if n_success > 0
+                    else np.nan
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def plot_stagewise_extraction_rates(
+    stagewise_summary: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    labels = [
+        f"Direction {int(stage)}"
+        for stage in stagewise_summary["stage"]
+    ]
+    rates = (
+        100.0
+        * stagewise_summary["extraction_success_rate"].to_numpy(
+            dtype=float
+        )
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(labels, rates)
+
+    ax.set_ylim(0.0, 105.0)
+    ax.set_ylabel("Trajectories with an accepted estimate (%)")
+    ax.set_title("How often each direction is extracted")
+    ax.grid(True, axis="y", alpha=0.25)
+
+    for bar, value in zip(bars, rates):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            value + 1.5,
+            f"{value:.1f}%",
+            ha="center",
+            va="bottom",
+        )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_stagewise_angle_errors(
+    all_trials: pd.DataFrame,
+    cfg: Config,
+    output_path: Path,
+) -> None:
+    labels: list[str] = []
+    medians: list[float] = []
+    lower_errors: list[float] = []
+    upper_errors: list[float] = []
+
+    for stage in range(1, cfg.n_directions + 1):
+        success = all_trials[
+            f"stage_{stage}_extraction_success"
+        ].astype(bool)
+
+        values = all_trials.loc[
+            success,
+            f"stage_{stage}_angle_error_deg",
+        ].dropna().to_numpy(dtype=float)
+
+        if len(values) == 0:
+            continue
+
+        median = float(np.median(values))
+        q25 = float(np.quantile(values, 0.25))
+        q75 = float(np.quantile(values, 0.75))
+
+        labels.append(f"Direction {stage}")
+        medians.append(median)
+        lower_errors.append(max(median - q25, 0.0))
+        upper_errors.append(max(q75 - median, 0.0))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    if medians:
+        x = np.arange(len(medians))
+        plot_floor = 1e-8
+
+        plotted_medians = np.maximum(
+            np.asarray(medians, dtype=float),
+            plot_floor,
+        )
+        plotted_lower = np.minimum(
+            np.asarray(lower_errors, dtype=float),
+            plotted_medians - plot_floor,
+        )
+        plotted_upper = np.asarray(
+            upper_errors,
+            dtype=float,
+        )
+
+        ax.errorbar(
+            x,
+            plotted_medians,
+            yerr=np.vstack(
+                [plotted_lower, plotted_upper]
+            ),
+            fmt="o",
+            capsize=6,
+        )
+
+        ax.set_xticks(x, labels)
+        ax.set_yscale("log")
+
+        for xpos, plotted, actual in zip(
+            x,
+            plotted_medians,
+            medians,
+        ):
+            ax.annotate(
+                f"{actual:.6f}°",
+                (xpos, plotted),
+                xytext=(0, 10),
+                textcoords="offset points",
+                ha="center",
+            )
+
+    ax.set_xlabel("Extracted direction")
+    ax.set_ylabel("Median angular error (degrees, log scale)")
+    ax.set_title(
+        "Accuracy when a direction is extracted"
+    )
+    ax.grid(True, axis="y", alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def build_component_success_curve(
+    all_trials: pd.DataFrame,
+    stage: int,
+    n_bins: int = 6,
+) -> pd.DataFrame:
+    component_col = f"abs_initial_component_q{stage}"
+    success_col = f"stage_{stage}_extraction_success"
+
+    data = all_trials[
+        [component_col, success_col]
+    ].dropna().copy()
+
+    if data.empty:
+        return pd.DataFrame()
+
+    n_unique = int(data[component_col].nunique())
+    q = min(n_bins, n_unique)
+
+    if q < 2:
+        return pd.DataFrame()
+
+    data["component_bin"] = pd.qcut(
+        data[component_col],
+        q=q,
+        duplicates="drop",
+    )
+
+    curve = (
+        data.groupby(
+            "component_bin",
+            observed=True,
+        )
+        .agg(
+            median_initial_component=(component_col, "median"),
+            extraction_success_rate=(success_col, "mean"),
+            n_trials=(success_col, "size"),
+        )
+        .reset_index(drop=True)
+    )
+
+    curve["stage"] = stage
+    curve["direction"] = f"q{stage}"
+    return curve
+
+
+def plot_success_vs_initial_component(
+    all_trials: pd.DataFrame,
+    cfg: Config,
+    output_path: Path,
+    data_output_path: Path,
+) -> None:
+    curves: list[pd.DataFrame] = []
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for stage in range(1, cfg.n_directions + 1):
+        curve = build_component_success_curve(
+            all_trials=all_trials,
+            stage=stage,
+        )
+
+        if curve.empty:
+            continue
+
+        curves.append(curve)
+
+        ax.plot(
+            curve["median_initial_component"],
+            100.0 * curve["extraction_success_rate"],
+            marker="o",
+            label=f"Direction {stage}",
+        )
+
+    ax.set_xlabel(r"Initial component magnitude $|a_i|$")
+    ax.set_ylabel("Extraction success rate (%)")
+    ax.set_ylim(0.0, 105.0)
+    ax.set_title(
+        "Direction extraction versus its initial component"
+    )
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+    if curves:
+        pd.concat(
+            curves,
+            ignore_index=True,
+        ).to_csv(
+            data_output_path,
+            index=False,
+        )
+    else:
+        pd.DataFrame().to_csv(
+            data_output_path,
+            index=False,
+        )
+
 def plot_first_trial_diagnostics(
     diagnostics: pd.DataFrame,
     cfg: Config,
@@ -899,6 +1386,15 @@ def main() -> None:
         type=float,
         default=0.80,
     )
+    parser.add_argument(
+        "--recovery-tolerance-deg",
+        type=float,
+        default=1.0,
+        help=(
+            "Synthetic validation tolerance used only for recovery summaries "
+            "and plots."
+        ),
+    )
 
     parser.add_argument(
         "--output",
@@ -927,6 +1423,7 @@ def main() -> None:
         min_stage_pc1_energy_fraction=(
             args.min_stage_pc1_energy_fraction
         ),
+        recovery_tolerance_deg=args.recovery_tolerance_deg,
     )
 
     if cfg.n_directions < 1:
@@ -979,6 +1476,10 @@ def main() -> None:
         f"{cfg.min_stage_pc1_energy_fraction:.3f}"
     )
     print(
+        "synthetic recovery tolerance: "
+        f"{cfg.recovery_tolerance_deg:.3f} deg"
+    )
+    print(
         "normality error ||A^T A - A A^T||_F: "
         f"{normality_error:.6e}"
     )
@@ -1016,6 +1517,41 @@ def main() -> None:
     all_trials.to_csv(
         outdir / "all_trial_metrics.csv",
         index=False,
+    )
+
+    stagewise_summary = summarise_stagewise_extraction(
+        all_trials=all_trials,
+        cfg=cfg,
+    )
+    stagewise_summary.to_csv(
+        outdir / "stagewise_extraction_summary.csv",
+        index=False,
+    )
+
+    plot_stagewise_extraction_rates(
+        stagewise_summary=stagewise_summary,
+        output_path=(
+            outdir / "01_stagewise_extraction_success_rate.png"
+        ),
+    )
+
+    plot_stagewise_angle_errors(
+        all_trials=all_trials,
+        cfg=cfg,
+        output_path=(
+            outdir / "02_stagewise_angle_errors.png"
+        ),
+    )
+
+    plot_success_vs_initial_component(
+        all_trials=all_trials,
+        cfg=cfg,
+        output_path=(
+            outdir / "03_success_vs_initial_component.png"
+        ),
+        data_output_path=(
+            outdir / "success_vs_initial_component.csv"
+        ),
     )
 
     stage_summary = summarise_trials(
@@ -1058,7 +1594,7 @@ def main() -> None:
         all_trials=all_trials,
         cfg=cfg,
         output_path=(
-            outdir / "01_angle_errors_same_selected_window.png"
+            outdir / "04_joint_common_window_angle_errors.png"
         ),
     )
 
@@ -1133,7 +1669,10 @@ def main() -> None:
         index=False,
     )
 
-    print("\nOverall summary:")
+    print("\nStage-wise extraction summary:")
+    print(stagewise_summary.to_string(index=False))
+
+    print("\nOverall all-directions-common-window summary:")
     for key, value in overall_summary.items():
         if isinstance(value, float):
             print(f"{key}: {value:.8e}")
