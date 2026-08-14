@@ -610,7 +610,7 @@ def plot_q1_errors(all_trials: pd.DataFrame, output_path: Path) -> None:
             data.append(values)
     fig, ax = plt.subplots(figsize=(8, 5))
     if data:
-        ax.boxplot(data, tick_labels=labels, showfliers=True)
+        ax.boxplot(data, labels=labels, showfliers=True)
         ax.axhline(1.0, linestyle="--", label="1 degree reporting threshold")
         ax.legend()
     ax.set_ylabel("Sign-invariant q1 angle error (degrees)")
