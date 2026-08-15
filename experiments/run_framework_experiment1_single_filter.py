@@ -65,6 +65,7 @@ estimate_from_observations_only = ESTIMATOR.estimate_from_observations_only
 simulate_trajectory = ESTIMATOR.simulate_trajectory
 angle_deg = ESTIMATOR.angle_deg
 max_principal_angle_deg = ESTIMATOR.max_principal_angle_deg
+common_window_is_stable = ESTIMATOR.common_window_is_stable
 
 
 @dataclass(frozen=True)
@@ -278,6 +279,20 @@ def _selected_diagnostic_values(info: dict, stage: int = 1) -> dict[str, float]:
     }
 
 
+def first_acceptable_window(
+    diagnostics: pd.DataFrame,
+    cfg: EstimatorConfig,
+) -> pd.Series | None:
+    """Return the earliest window satisfying the estimator's acceptance rule."""
+    for i in range(len(diagnostics)):
+        if i < cfg.stability_patience - 1:
+            continue
+        recent = diagnostics.iloc[i - cfg.stability_patience + 1 : i + 1]
+        if common_window_is_stable(recent, cfg):
+            return diagnostics.iloc[i]
+    return None
+
+
 def analyse_trial(
     *,
     cfg: ExperimentConfig,
@@ -297,8 +312,11 @@ def analyse_trial(
     X = simulate_trajectory(A=A, x0=x0, steps=cfg.steps)
     L = np.zeros(cfg.dim, dtype=float)
 
-    directions, info, _ = estimate_from_observations_only(X=X, L=L, cfg=one_filter_cfg)
+    directions, info, diagnostics = estimate_from_observations_only(
+        X=X, L=L, cfg=one_filter_cfg
+    )
     accepted = bool(info.get("success", False) and len(directions) == 1)
+    first_selected = first_acceptable_window(diagnostics, one_filter_cfg)
 
     row: dict = {
         **system_metadata,
@@ -307,6 +325,12 @@ def analyse_trial(
         "initial_state_index": initial_state_index,
         "trial_seed": trial_seed,
         "accepted_stage_1": accepted,
+        "first_acceptable_window_start": (
+            float(first_selected["window_start"]) if first_selected is not None else np.nan
+        ),
+        "first_acceptable_window_end": (
+            float(first_selected["window_end"]) if first_selected is not None else np.nan
+        ),
         "selected_window_start": info.get("window_start", np.nan),
         "selected_window_end": info.get("window_end", np.nan),
         "relative_window_norm": info.get("relative_window_norm", np.nan),
@@ -469,15 +493,27 @@ def summarize_experiment1(all_trials: pd.DataFrame, cfg: ExperimentConfig) -> pd
     rows: list[dict] = []
     for case_index, case in enumerate(CASES):
         group = all_trials.loc[all_trials["case"] == case].copy()
+        accepted_group = group.loc[group["accepted_stage_1"]].copy()
+        first_accept = accepted_group["first_acceptable_window_end"].dropna()
         common = {
             "case": case,
             "target_type": group["target_type"].iloc[0],
             "n_systems": int(group["system_replicate"].nunique()),
-            "n_initial_states": int(len(group)),
+            "n_initial_states_per_system": int(cfg.initial_states_per_system),
+            "n_trajectories": int(len(group)),
+            "median_first_acceptable_window_end": (
+                float(first_accept.median()) if len(first_accept) else np.nan
+            ),
+            "q25_first_acceptable_window_end": (
+                float(first_accept.quantile(0.25)) if len(first_accept) else np.nan
+            ),
+            "q75_first_acceptable_window_end": (
+                float(first_accept.quantile(0.75)) if len(first_accept) else np.nan
+            ),
             "median_selected_window_end_accepted": float(
-                group.loc[group["accepted_stage_1"], "selected_window_end"].median()
+                accepted_group["selected_window_end"].median()
             )
-            if group["accepted_stage_1"].any()
+            if len(accepted_group)
             else np.nan,
         }
 
@@ -524,6 +560,8 @@ def summarize_experiment1(all_trials: pd.DataFrame, cfg: ExperimentConfig) -> pd
             row.update(
                 {
                     "acceptance_rate": float(group["accepted_stage_1"].mean()),
+                    "acceptance_rate_ci95_low": false_unique["ci95_low"],
+                    "acceptance_rate_ci95_high": false_unique["ci95_high"],
                     "overall_successful_recovery_rate": np.nan,
                     "reliability_given_accepted": np.nan,
                     "false_acceptance_rate": np.nan,
@@ -620,6 +658,158 @@ def plot_q1_errors(all_trials: pd.DataFrame, output_path: Path) -> None:
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
+
+
+def build_report_tables(
+    all_trials: pd.DataFrame,
+    systems: pd.DataFrame,
+    summary: pd.DataFrame,
+    cfg: ExperimentConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build compact report tables for Experiment 1."""
+    design_rows: list[dict] = []
+    case_labels = {
+        "strong_gap": "Strong gap",
+        "weak_gap": "Weak gap",
+        "equal_magnitude": "Equal magnitude",
+        "rotation": "Contracting rotation",
+    }
+    target_labels = {
+        "strong_gap": "Unique q1",
+        "weak_gap": "Unique q1",
+        "equal_magnitude": "No unique 1-D target",
+        "rotation": "No unique 1-D target",
+    }
+
+    for case in CASES:
+        sg = systems.loc[systems["case"] == case]
+        if case == "rotation":
+            mode = f"{cfg.lambda1:.2f} R({cfg.rotation_angle_deg:.0f} deg)"
+            lambda2_display = mode
+        elif case == "equal_magnitude":
+            lambda2_display = f"{-abs(cfg.lambda1):.2f}"
+        else:
+            lambda2_display = f"{float(sg['lambda2_abs'].iloc[0]):.2f}"
+
+        ratio = float(sg["spectral_ratio_abs_lambda2_over_lambda1"].iloc[0])
+        design_rows.append(
+            {
+                "case": case_labels[case],
+                "target": target_labels[case],
+                "lambda1_abs": float(sg["lambda1_abs"].iloc[0]),
+                "second_leading_structure": lambda2_display,
+                "abs_lambda2_over_lambda1": ratio,
+                "n_systems": int(sg["system_replicate"].nunique()),
+                "initial_states_per_system": int(cfg.initial_states_per_system),
+                "total_trajectories": int(
+                    len(all_trials.loc[all_trials["case"] == case])
+                ),
+                "window_m": int(cfg.window),
+                "stability_threshold_deg": float(cfg.stability_threshold_deg),
+                "stability_patience": int(cfg.stability_patience),
+                "pc1_energy_threshold": float(cfg.min_stage_pc1_energy_fraction),
+                "external_tolerance_deg": float(cfg.recovery_tolerance_deg),
+            }
+        )
+
+    table1 = pd.DataFrame(design_rows)
+
+    result_rows: list[dict] = []
+    for _, row in summary.iterrows():
+        case = str(row["case"])
+        group = all_trials.loc[all_trials["case"] == case]
+        n_total = len(group)
+        n_accepted = int(group["accepted_stage_1"].astype(bool).sum())
+
+        if case in UNIQUE_CASES:
+            n_correct = int(group["accepted_and_correct_stage_1"].astype(bool).sum())
+            n_false = int(group["false_acceptance_stage_1"].astype(bool).sum())
+            error_text = (
+                f"{row['median_q1_error_deg_accepted']:.6f} "
+                f"[{row['q25_q1_error_deg_accepted']:.6f}, "
+                f"{row['q75_q1_error_deg_accepted']:.6f}]"
+            )
+            success_text = f"{n_correct}/{n_total} ({100*row['overall_successful_recovery_rate']:.1f}%)"
+            reliability_text = f"{100*row['reliability_given_accepted']:.1f}%"
+            false_text = f"{n_false}/{n_total} ({100*row['false_acceptance_rate']:.1f}%)"
+        else:
+            error_text = "N/A"
+            success_text = "N/A"
+            reliability_text = "N/A"
+            n_false_unique = int(group["false_unique_direction_acceptance"].astype(bool).sum())
+            false_text = (
+                f"{n_false_unique}/{n_total} "
+                f"({100*row['false_unique_direction_acceptance_rate']:.1f}%)"
+            )
+
+        first_text = "N/A"
+        if "median_first_acceptable_window_end" in row.index and pd.notna(
+            row["median_first_acceptable_window_end"]
+        ):
+            first_text = (
+                f"{row['median_first_acceptable_window_end']:.1f} "
+                f"[{row['q25_first_acceptable_window_end']:.1f}, "
+                f"{row['q75_first_acceptable_window_end']:.1f}]"
+            )
+
+        result_rows.append(
+            {
+                "case": case_labels[case],
+                "accepted": f"{n_accepted}/{n_total} ({100*n_accepted/n_total:.1f}%)",
+                "overall_successful_recovery": success_text,
+                "reliability_given_accepted": reliability_text,
+                "false_acceptance_or_false_unique_acceptance": false_text,
+                "median_q1_error_deg_IQR": error_text,
+                "first_acceptable_window_end_median_IQR": first_text,
+            }
+        )
+
+    table2 = pd.DataFrame(result_rows)
+    return table1, table2
+
+
+def save_markdown_table(frame: pd.DataFrame, path: Path, title: str) -> None:
+    """Save a lightweight Markdown table without requiring optional packages."""
+    def cell(v):
+        if pd.isna(v):
+            return "N/A"
+        return str(v).replace("|", "\\|")
+
+    headers = [cell(c) for c in frame.columns]
+    lines = [f"# {title}", "", "| " + " | ".join(headers) + " |"]
+    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+    for _, row in frame.iterrows():
+        lines.append("| " + " | ".join(cell(v) for v in row.tolist()) + " |")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def plot_first_acceptable_window(all_trials: pd.DataFrame, output_path: Path) -> None:
+    """Compare how quickly strong- and weak-gap cases first satisfy acceptance."""
+    if "first_acceptable_window_end" not in all_trials.columns:
+        return
+
+    data: list[np.ndarray] = []
+    labels: list[str] = []
+    for case, label in (("strong_gap", "Strong gap"), ("weak_gap", "Weak gap")):
+        values = all_trials.loc[
+            (all_trials["case"] == case) & all_trials["accepted_stage_1"],
+            "first_acceptable_window_end",
+        ].dropna().to_numpy(dtype=float)
+        if len(values):
+            data.append(values)
+            labels.append(label)
+
+    if not data:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.boxplot(data, labels=labels, showfliers=True)
+    ax.set_ylabel("First acceptable window end")
+    ax.set_title("Experiment 1: time to first internally acceptable q1 estimate")
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
 
 def plot_plane_diagnostic(plane_summary: pd.DataFrame, output_path: Path) -> None:
     if plane_summary.empty:
@@ -766,14 +956,30 @@ def main() -> None:
     all_trials.to_csv(output / "all_trials.csv", index=False)
     systems.to_csv(output / "systems.csv", index=False)
     summary.to_csv(output / "summary.csv", index=False)
+
+    table1, table2 = build_report_tables(all_trials, systems, summary, cfg)
+    table1.to_csv(output / "table1_experiment_design.csv", index=False)
+    table2.to_csv(output / "table2_main_results.csv", index=False)
+    save_markdown_table(
+        table1,
+        output / "table1_experiment_design.md",
+        "Experiment 1 - Experimental design",
+    )
+    save_markdown_table(
+        table2,
+        output / "table2_main_results.md",
+        "Experiment 1 - Main results",
+    )
+
     if not plane_trials.empty:
         plane_trials.to_csv(output / "two_filter_plane_trials.csv", index=False)
         plane_summary.to_csv(output / "two_filter_plane_summary.csv", index=False)
 
     plot_single_filter_rates(summary, output / "01_single_filter_outcomes.png")
     plot_q1_errors(all_trials, output / "02_q1_error_distribution.png")
+    plot_first_acceptable_window(all_trials, output / "03_first_acceptable_window.png")
     if not plane_summary.empty:
-        plot_plane_diagnostic(plane_summary, output / "03_two_filter_plane_recovery.png")
+        plot_plane_diagnostic(plane_summary, output / "04_two_filter_plane_recovery.png")
 
     print("\n=== Experiment 1 summary ===")
     print(summary.to_string(index=False))
