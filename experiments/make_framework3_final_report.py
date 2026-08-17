@@ -102,12 +102,32 @@ def rate_ci_hierarchical(
     }
 
 
+def dataframe_to_markdown_no_tabulate(df: pd.DataFrame) -> str:
+    """Return a simple GitHub-style Markdown table without optional dependencies."""
+    def fmt_value(value):
+        if pd.isna(value):
+            return ""
+        if isinstance(value, (float, np.floating)):
+            return f"{float(value):.6g}"
+        text = str(value)
+        return text.replace("|", "\\|").replace("\n", " " )
+
+    headers = [str(c).replace("|", "\\|") for c in df.columns]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for row in df.itertuples(index=False, name=None):
+        lines.append("| " + " | ".join(fmt_value(v) for v in row) + " |")
+    return "\n".join(lines)
+
+
 def save_table(df: pd.DataFrame, output_dir: Path, stem: str) -> None:
     csv_path = output_dir / f"{stem}.csv"
     md_path = output_dir / f"{stem}.md"
     df.to_csv(csv_path, index=False)
     with md_path.open("w", encoding="utf-8") as f:
-        f.write(df.to_markdown(index=False))
+        f.write(dataframe_to_markdown_no_tabulate(df))
         f.write("\n")
 
 
