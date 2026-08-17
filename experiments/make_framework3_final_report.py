@@ -403,8 +403,21 @@ def latest_condition_rows_from_npz(
     uid_to_system = events.drop_duplicates("trajectory_uid").set_index("trajectory_uid")["system_uid"].to_dict()
 
     for case_name in case_names:
-        npz_path = results_dir / f"{case_name}.npz"
-        if not npz_path.exists():
+        # Experiment 3 stores per-case traces under results_dir/time_traces/.
+        # Keep a fallback to the results root for compatibility with older runs.
+        candidate_paths = [
+            results_dir / "time_traces" / f"{case_name}.npz",
+            results_dir / f"{case_name}.npz",
+        ]
+        npz_path = next((p for p in candidate_paths if p.exists()), None)
+
+        # Final fallback: search recursively inside this experiment's result folder.
+        if npz_path is None:
+            matches = list(results_dir.rglob(f"{case_name}.npz"))
+            if len(matches) == 1:
+                npz_path = matches[0]
+
+        if npz_path is None:
             missing.append(case_name)
             continue
         z = np.load(npz_path, allow_pickle=True)
