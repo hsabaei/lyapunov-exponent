@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import sys
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -55,9 +56,24 @@ def _load_estimator_module():
 ESTIMATOR = _load_estimator_module()
 EstimatorConfig = ESTIMATOR.Config
 rolling_same_window_diagnostics = ESTIMATOR.rolling_same_window_diagnostics
-select_prefix_window = ESTIMATOR.select_prefix_window
+prefix_window_is_stable = ESTIMATOR.prefix_window_is_stable
 simulate_trajectory = ESTIMATOR.simulate_trajectory
 angle_deg = ESTIMATOR.angle_deg
+
+
+SPECTRUM_CASES: Dict[str, Tuple[float, ...]] = {
+    "strong_gap": (0.96, 0.88, 0.80, 0.72, 0.64),
+    "moderate_gap": (0.96, 0.92, 0.88, 0.84, 0.80),
+    "weak_gap": (0.96, 0.95, 0.94, 0.93, 0.92),
+}
+
+EXCITATION_PROFILES: Dict[str, Tuple[float, ...]] = {
+    "balanced": (1.0, 1.0, 1.0, 1.0, 1.0),
+    "mild_decreasing": (1.0, 0.5, 0.25, 0.125, 0.0625),
+    "strong_decreasing": (1.0, 0.3, 0.1, 0.03, 0.01),
+    "increasing": (1.0, 2.0, 4.0, 8.0, 16.0),
+    "later_modes_strong": (1.0, 3.0, 3.0, 3.0, 3.0),
+}
 
 
 @dataclass(frozen=True)
@@ -67,25 +83,18 @@ class ExperimentConfig:
     window: int = 20
     n_directions: int = 5
 
-    # All targets are real, distinct, orthogonal eigendirections of a normal system.
-    leading_eigenvalues: Tuple[float, ...] = (0.96, 0.95, 0.94, 0.93, 0.92)
-
     system_replicates: int = 10
     initial_states_per_system: int = 20
     seed: int = 42
 
-    # All target modes remain present (no alpha=0 target-absence confound).
-    # q1 amplitude is fixed to 1; q2...qk are sampled log-uniformly in this range.
-    leading_excitation_min: float = 1e-3
-    leading_excitation_max: float = 3.0
+    # Non-target coefficients q6...qd. The same random draw is reused across
+    # excitation profiles for a given system/initial-state replicate.
     tail_coefficient_scale: float = 0.10
-
-    # Lower modes remain spectrally below q_k.
     tail_max: float = 0.90
     tail_min: float = 0.20
     tail_gap_below_last_target: float = 0.01
 
-    # Observation-only acceptance criteria, frozen before evaluation.
+    # Observation-only acceptance criteria: frozen before evaluation.
     stability_threshold_deg: float = 0.2
     stability_patience: int = 5
     relative_window_norm_floor: float = 1e-12
@@ -93,56 +102,61 @@ class ExperimentConfig:
     numeric_relative_residual_floor: float = 1e-15
     min_stage_pc1_energy_fraction: float = 0.80
 
-    # External correctness tolerance only; never used to select a window.
-    recovery_tolerance_deg: float = 1.0
+    # External correctness only. Never used in window acceptance.
+    recovery_tolerance_deg: float = 2.5
 
-    # Hierarchical bootstrap: systems first, then trajectories within system.
+    # A sustained recovery starts at the first of this many consecutive
+    # windows for which the prefix is accepted and q_i is externally correct.
+    recovery_persistence_windows: int = 5
+
+    # Hierarchical bootstrap: systems first, then initial states.
     bootstrap_replicates: int = 2000
 
-
-def parse_float_list(text: str) -> Tuple[float, ...]:
-    values = tuple(float(v.strip()) for v in text.split(",") if v.strip())
-    if not values:
-        raise argparse.ArgumentTypeError("Expected at least one comma-separated number.")
-    return values
+    # Save compact per-case arrays in addition to CSV summaries.
+    save_trace_npz: bool = True
 
 
 def validate_config(cfg: ExperimentConfig) -> None:
-    if cfg.n_directions < 2:
-        raise ValueError("n_directions must be at least 2.")
-    if cfg.dim < cfg.n_directions + 1:
+    if cfg.n_directions != 5:
+        raise ValueError("This experiment is prespecified for q1,...,q5 (n_directions=5).")
+    if cfg.dim <= cfg.n_directions:
         raise ValueError("dim must exceed n_directions so lower non-target modes exist.")
-    if len(cfg.leading_eigenvalues) != cfg.n_directions:
-        raise ValueError("leading_eigenvalues must contain exactly n_directions values.")
-    mags = np.abs(np.asarray(cfg.leading_eigenvalues, dtype=float))
-    if not np.all((mags > 0.0) & (mags < 1.0)):
-        raise ValueError("All leading eigenvalue magnitudes must lie in (0,1).")
-    if not np.all(mags[:-1] > mags[1:]):
-        raise ValueError("Require strictly decreasing target magnitudes |lambda1|>...>|lambdak|.")
     if cfg.steps < 1:
         raise ValueError("steps must be positive.")
-    if cfg.window < 2 or cfg.window > cfg.steps + 1:
+    if not (2 <= cfg.window <= cfg.steps + 1):
         raise ValueError("window must satisfy 2 <= window <= steps + 1.")
-    if cfg.system_replicates < 1 or cfg.initial_states_per_system < 1:
-        raise ValueError("replicate counts must be positive.")
-    if cfg.leading_excitation_min <= 0.0:
-        raise ValueError("leading_excitation_min must be positive: Experiment 3 keeps targets identifiable.")
-    if cfg.leading_excitation_max < cfg.leading_excitation_min:
-        raise ValueError("leading_excitation_max must be >= leading_excitation_min.")
-    if cfg.tail_coefficient_scale < 0.0:
-        raise ValueError("tail_coefficient_scale must be nonnegative.")
-    if not (0.0 < cfg.tail_min < cfg.tail_max < 1.0):
-        raise ValueError("Require 0 < tail_min < tail_max < 1.")
-    available_tail_max = min(
-        cfg.tail_max,
-        float(mags[-1]) - cfg.tail_gap_below_last_target,
-    )
-    if available_tail_max <= cfg.tail_min:
-        raise ValueError("No valid lower-mode interval below the final target eigenvalue.")
+    if cfg.system_replicates != 10:
+        raise ValueError("Prespecified design requires exactly 10 systems per case.")
+    if cfg.initial_states_per_system != 20:
+        raise ValueError("Prespecified design requires exactly 20 initial states per system.")
+    if cfg.recovery_persistence_windows < 1:
+        raise ValueError("recovery_persistence_windows must be positive.")
     if cfg.bootstrap_replicates < 100:
         raise ValueError("bootstrap_replicates should be at least 100.")
     if cfg.recovery_tolerance_deg <= 0.0:
         raise ValueError("recovery_tolerance_deg must be positive.")
+    if cfg.tail_coefficient_scale < 0.0:
+        raise ValueError("tail_coefficient_scale must be nonnegative.")
+    if not (0.0 < cfg.tail_min < cfg.tail_max < 1.0):
+        raise ValueError("Require 0 < tail_min < tail_max < 1.")
+
+    for name, spectrum in SPECTRUM_CASES.items():
+        if len(spectrum) != cfg.n_directions:
+            raise ValueError(f"Spectrum {name} must have {cfg.n_directions} values.")
+        mags = np.abs(np.asarray(spectrum, dtype=float))
+        if not np.all((mags > 0.0) & (mags < 1.0)):
+            raise ValueError(f"Spectrum {name} has an invalid eigenvalue magnitude.")
+        if not np.all(mags[:-1] > mags[1:]):
+            raise ValueError(f"Spectrum {name} must satisfy |lambda1|>...>|lambda5|.")
+        available_tail_max = min(cfg.tail_max, float(mags[-1]) - cfg.tail_gap_below_last_target)
+        if available_tail_max <= cfg.tail_min:
+            raise ValueError(f"Spectrum {name} leaves no valid lower-mode interval.")
+
+    for name, profile in EXCITATION_PROFILES.items():
+        if len(profile) != cfg.n_directions:
+            raise ValueError(f"Excitation profile {name} must have {cfg.n_directions} values.")
+        if np.any(np.asarray(profile, dtype=float) <= 0.0):
+            raise ValueError(f"Excitation profile {name} must keep all targets nonzero.")
 
 
 def _estimator_config_kwargs(cfg: ExperimentConfig) -> Dict[str, object]:
@@ -177,7 +191,7 @@ def normalize(v: np.ndarray) -> np.ndarray:
     return v / n
 
 
-def orthonormal_basis(vectors: List[np.ndarray], dim: int) -> np.ndarray:
+def orthonormal_basis(vectors: Sequence[np.ndarray], dim: int) -> np.ndarray:
     if not vectors:
         return np.empty((dim, 0), dtype=float)
     M = np.column_stack([normalize(v) for v in vectors])
@@ -192,35 +206,38 @@ def deflate_by_basis(error_window: np.ndarray, basis: np.ndarray) -> np.ndarray:
     return error_window @ (np.eye(error_window.shape[1]) - B @ B.T)
 
 
-def top_right_singular_direction(matrix: np.ndarray) -> Tuple[np.ndarray, float, float]:
+def top_right_singular_direction(matrix: np.ndarray) -> np.ndarray:
     matrix = np.asarray(matrix, dtype=float)
     if matrix.ndim != 2:
         raise ValueError("matrix must be 2-D")
     norm = float(np.linalg.norm(matrix, ord="fro"))
     if not np.isfinite(norm) or norm <= EPS:
-        return np.full(matrix.shape[1], np.nan), np.nan, np.nan
-    _u, s, vt = np.linalg.svd(matrix, full_matrices=False)
-    direction = normalize(vt[0])
-    energy = float(np.sum(s * s))
-    pc1 = float(s[0] ** 2 / energy) if energy > EPS else np.nan
-    ratio = float(s[0] / s[1]) if len(s) > 1 and s[1] > EPS else np.inf
-    return direction, pc1, ratio
+        return np.full(matrix.shape[1], np.nan)
+    _u, _s, vt = np.linalg.svd(matrix, full_matrices=False)
+    return normalize(vt[0])
 
 
 def build_random_normal_system(
-    cfg: ExperimentConfig, system_seed: int
+    cfg: ExperimentConfig,
+    leading_eigenvalues: Sequence[float],
+    system_seed: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Paired system geometry: same seed => same Q across spectral cases."""
     rng = np.random.default_rng(system_seed)
     G = rng.normal(size=(cfg.dim, cfg.dim))
     Q, _ = np.linalg.qr(G)
 
-    leading = np.asarray(cfg.leading_eigenvalues, dtype=float)
-    remaining = cfg.dim - cfg.n_directions
+    leading = np.asarray(leading_eigenvalues, dtype=float)
     available_tail_max = min(
         cfg.tail_max,
-        abs(leading[-1]) - cfg.tail_gap_below_last_target,
+        abs(float(leading[-1])) - cfg.tail_gap_below_last_target,
     )
-    tail_magnitudes = rng.uniform(cfg.tail_min, available_tail_max, size=remaining)
+    remaining = cfg.dim - cfg.n_directions
+
+    # The same U(0,1) values and signs are reused across spectra, then mapped
+    # into the spectrum-specific valid interval. This makes spectrum comparisons paired.
+    u = rng.uniform(0.0, 1.0, size=remaining)
+    tail_magnitudes = cfg.tail_min + u * (available_tail_max - cfg.tail_min)
     tail_magnitudes = np.sort(tail_magnitudes)[::-1]
     tail_signs = rng.choice(np.array([-1.0, 1.0]), size=remaining)
     tail = tail_signs * tail_magnitudes
@@ -233,47 +250,447 @@ def build_random_normal_system(
     return A, Q, eigenvalues, normality_error
 
 
-def construct_initial_state(
+def construct_controlled_initial_state(
     cfg: ExperimentConfig,
     true_basis: np.ndarray,
-    trial_seed: int,
+    excitation_profile: Sequence[float],
+    state_seed: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(trial_seed)
+    """
+    Use fixed target magnitudes for the case, random signs, and random lower-mode
+    coefficients. The seed is intentionally independent of excitation profile,
+    so signs/tail coefficients are paired across profile comparisons.
+    """
+    rng = np.random.default_rng(state_seed)
     coefficients = rng.normal(0.0, cfg.tail_coefficient_scale, size=cfg.dim)
 
-    # Keep q1 as the scale reference.
-    coefficients[0] = float(rng.choice(np.array([-1.0, 1.0])))
-
-    # q2...qk are all nonzero but span an intentionally broad range.
-    lo = np.log(cfg.leading_excitation_min)
-    hi = np.log(cfg.leading_excitation_max)
-    magnitudes = np.exp(rng.uniform(lo, hi, size=cfg.n_directions - 1))
-    signs = rng.choice(np.array([-1.0, 1.0]), size=cfg.n_directions - 1)
-    coefficients[1 : cfg.n_directions] = signs * magnitudes
+    target_signs = rng.choice(np.array([-1.0, 1.0]), size=cfg.n_directions)
+    coefficients[: cfg.n_directions] = (
+        target_signs * np.asarray(excitation_profile, dtype=float)
+    )
 
     x0 = true_basis @ coefficients
     return x0, coefficients
 
 
-def correctness_value(accepted: bool, error_deg: float, tolerance: float) -> Optional[bool]:
-    if not accepted:
-        return None
-    if not np.isfinite(error_deg):
-        return False
-    return bool(error_deg <= tolerance)
+def compute_prefix_acceptance_matrix(
+    diagnostics: pd.DataFrame,
+    cfg: ExperimentConfig,
+) -> np.ndarray:
+    """
+    Exact vectorized-equivalent implementation of estimator prefix acceptance.
+
+    accepted[i, k-1] says that at diagnostics row i the first k directions
+    simultaneously satisfy the observation-only acceptance rule over the most
+    recent stability_patience windows.
+    """
+    n_windows = len(diagnostics)
+    out = np.zeros((n_windows, cfg.n_directions), dtype=bool)
+    p = cfg.stability_patience
+
+    for i in range(n_windows):
+        if i < p - 1:
+            continue
+        recent = diagnostics.iloc[i - p + 1 : i + 1]
+        if float(recent.iloc[-1]["relative_window_norm"]) < cfg.relative_window_norm_floor:
+            continue
+
+        cumulative_ok = True
+        for stage in range(1, cfg.n_directions + 1):
+            changes = recent[f"stage_{stage}_direction_change_deg"].to_numpy(dtype=float)
+            finite_changes = changes[np.isfinite(changes)]
+            stage_ok = len(finite_changes) >= p - 1
+            if stage_ok:
+                stage_ok = bool(np.all(finite_changes <= cfg.stability_threshold_deg))
+
+            pc1 = recent[f"stage_{stage}_stage_pc1_energy_fraction"].to_numpy(dtype=float)
+            if stage_ok:
+                stage_ok = bool(
+                    np.all(np.isfinite(pc1))
+                    and np.all(pc1 >= cfg.min_stage_pc1_energy_fraction)
+                )
+
+            residual_before = recent[
+                f"stage_{stage}_residual_energy_before_fraction"
+            ].to_numpy(dtype=float)
+            if stage_ok:
+                stage_ok = bool(
+                    np.all(np.isfinite(residual_before))
+                    and np.all(residual_before >= cfg.min_residual_energy_fraction)
+                )
+
+            cumulative_ok = bool(cumulative_ok and stage_ok)
+            out[i, stage - 1] = cumulative_ok
+
+    return out
 
 
-def bool_or_nan(value: Optional[bool]):
-    if value is None:
+def verify_acceptance_against_estimator(
+    diagnostics: pd.DataFrame,
+    accepted: np.ndarray,
+    estimator_cfg: EstimatorConfig,
+) -> None:
+    """One-time safety check that our time-resolved acceptance matches the estimator."""
+    p = estimator_cfg.stability_patience
+    for i in range(len(diagnostics)):
+        if i < p - 1:
+            expected = [False] * estimator_cfg.n_directions
+        else:
+            recent = diagnostics.iloc[i - p + 1 : i + 1]
+            expected = [
+                bool(prefix_window_is_stable(recent, estimator_cfg, stage))
+                for stage in range(1, estimator_cfg.n_directions + 1)
+            ]
+        actual = accepted[i].tolist()
+        if actual != expected:
+            raise RuntimeError(
+                f"Time-resolved acceptance mismatch at diagnostics row {i}: "
+                f"actual={actual}, estimator={expected}"
+            )
+
+
+def theoretical_pointwise_dominance_time(
+    eigenvalues: np.ndarray,
+    coefficients: np.ndarray,
+    stage_index0: int,
+    competitor_stop_exclusive: int,
+) -> float:
+    """
+    Ground-truth diagnostic only.
+
+    Earliest continuous time t >= 0 at which mode i has amplitude at least as
+    large as every specified lower mode j>i:
+        |a_i lambda_i^t| >= |a_j lambda_j^t|.
+
+    This is NOT a prediction of the SVD-window acceptance time; it is a simple
+    pointwise modal-dominance reference.
+    """
+    ai = abs(float(coefficients[stage_index0]))
+    li = abs(float(eigenvalues[stage_index0]))
+    if ai <= 0.0:
+        return np.inf
+
+    required = 0.0
+    for j in range(stage_index0 + 1, competitor_stop_exclusive):
+        aj = abs(float(coefficients[j]))
+        lj = abs(float(eigenvalues[j]))
+        if aj <= 0.0:
+            continue
+        if not (li > lj > 0.0):
+            return np.inf
+        rhs = math.log(aj / ai) / math.log(li / lj)
+        required = max(required, rhs)
+    return float(max(0.0, required))
+
+
+def first_true_index(mask: np.ndarray) -> Optional[int]:
+    idx = np.flatnonzero(mask)
+    return int(idx[0]) if len(idx) else None
+
+
+def last_true_index(mask: np.ndarray) -> Optional[int]:
+    idx = np.flatnonzero(mask)
+    return int(idx[-1]) if len(idx) else None
+
+
+def first_consecutive_true_run(mask: np.ndarray, run_length: int) -> Tuple[Optional[int], Optional[int]]:
+    """Return (start_index, confirmation_index) of the first all-True run."""
+    if run_length <= 1:
+        idx = first_true_index(mask)
+        return idx, idx
+    count = 0
+    for i, value in enumerate(mask.astype(bool)):
+        count = count + 1 if value else 0
+        if count >= run_length:
+            start = i - run_length + 1
+            return int(start), int(i)
+    return None, None
+
+
+def safe_log10(x: float) -> float:
+    if not np.isfinite(x) or x <= 0.0:
         return np.nan
-    return bool(value)
+    return float(np.log10(x))
 
 
-def hierarchical_bootstrap_mean(
+def reference_error_at_window(
+    X: np.ndarray,
+    L: np.ndarray,
+    true_basis: np.ndarray,
+    stage: int,
+    window_start: int,
+    window_end: int,
+) -> float:
+    R = X[window_start : window_end + 1] - L
+    ref_prior = true_basis[:, : stage - 1]
+    R_ref = deflate_by_basis(R, ref_prior)
+    u_ref = top_right_singular_direction(R_ref)
+    if not np.all(np.isfinite(u_ref)):
+        return np.nan
+    return float(angle_deg(u_ref, true_basis[:, stage - 1]))
+
+
+def estimated_error_at_diag_row(
+    diagnostics: pd.DataFrame,
+    row_index: Optional[int],
+    stage: int,
+    true_basis: np.ndarray,
+) -> float:
+    if row_index is None:
+        return np.nan
+    direction = diagnostics.iloc[row_index][f"direction_{stage}"]
+    if direction is None:
+        return np.nan
+    return float(angle_deg(normalize(np.asarray(direction, dtype=float)), true_basis[:, stage - 1]))
+
+
+def event_reference_metrics(
+    diagnostics: pd.DataFrame,
+    X: np.ndarray,
+    L: np.ndarray,
+    true_basis: np.ndarray,
+    stage: int,
+    diag_index: Optional[int],
+) -> Tuple[float, float]:
+    if diag_index is None:
+        return np.nan, np.nan
+    row = diagnostics.iloc[diag_index]
+    est_error = estimated_error_at_diag_row(diagnostics, diag_index, stage, true_basis)
+    ref_error = reference_error_at_window(
+        X=X,
+        L=L,
+        true_basis=true_basis,
+        stage=stage,
+        window_start=int(row["window_start"]),
+        window_end=int(row["window_end"]),
+    )
+    penalty = est_error - ref_error if np.isfinite(est_error) and np.isfinite(ref_error) else np.nan
+    return float(ref_error), float(penalty)
+
+
+def analyse_one_trajectory_time_resolved(
+    *,
+    cfg: ExperimentConfig,
+    estimator_cfg: EstimatorConfig,
+    spectrum_name: str,
+    excitation_name: str,
+    excitation_profile: Sequence[float],
+    A: np.ndarray,
+    true_basis: np.ndarray,
+    eigenvalues: np.ndarray,
+    system_replicate: int,
+    system_seed: int,
+    state_index: int,
+    state_seed: int,
+    verify_acceptance: bool = False,
+) -> Tuple[Dict[str, object], List[Dict[str, object]], Dict[str, np.ndarray]]:
+    x0, coefficients = construct_controlled_initial_state(
+        cfg=cfg,
+        true_basis=true_basis,
+        excitation_profile=excitation_profile,
+        state_seed=state_seed,
+    )
+    X = simulate_trajectory(A=A, x0=x0, steps=cfg.steps)
+    L = np.zeros(cfg.dim, dtype=float)
+    diagnostics = rolling_same_window_diagnostics(X=X, L=L, cfg=estimator_cfg)
+
+    accepted = compute_prefix_acceptance_matrix(diagnostics, cfg)
+    if verify_acceptance:
+        verify_acceptance_against_estimator(diagnostics, accepted, estimator_cfg)
+
+    n_windows = len(diagnostics)
+    window_ends = diagnostics["window_end"].to_numpy(dtype=int)
+    window_starts = diagnostics["window_start"].to_numpy(dtype=int)
+
+    errors = np.full((cfg.n_directions, n_windows), np.nan, dtype=np.float64)
+    pc1 = np.full((cfg.n_directions, n_windows), np.nan, dtype=np.float64)
+    for stage in range(1, cfg.n_directions + 1):
+        pc1[stage - 1] = diagnostics[
+            f"stage_{stage}_stage_pc1_energy_fraction"
+        ].to_numpy(dtype=float)
+        for i in range(n_windows):
+            direction = diagnostics.iloc[i][f"direction_{stage}"]
+            if direction is None:
+                continue
+            errors[stage - 1, i] = angle_deg(
+                normalize(np.asarray(direction, dtype=float)),
+                true_basis[:, stage - 1],
+            )
+
+    correct_angle = np.isfinite(errors) & (errors <= cfg.recovery_tolerance_deg)
+    accepted_T = accepted.T
+    accepted_correct = accepted_T & correct_angle
+
+    x0_norm = float(np.linalg.norm(x0 - L))
+    endpoint_distance = np.linalg.norm(X[window_ends] - L, axis=1)
+    relative_distance = endpoint_distance / x0_norm if x0_norm > EPS else np.full(n_windows, np.nan)
+
+    system_uid = f"{spectrum_name}_sys_{system_replicate:02d}"
+    case_name = f"{spectrum_name}__{excitation_name}"
+    trajectory_uid = f"{case_name}__sys{system_replicate:02d}__state{state_index:02d}"
+
+    trajectory_row: Dict[str, object] = {
+        "case_name": case_name,
+        "spectrum_case": spectrum_name,
+        "excitation_case": excitation_name,
+        "system_uid": system_uid,
+        "paired_system_replicate": system_replicate,
+        "system_seed": system_seed,
+        "trajectory_uid": trajectory_uid,
+        "initial_state_within_system": state_index,
+        "state_seed": state_seed,
+        "x0_norm": x0_norm,
+        "tail_coefficient_l2_norm": float(np.linalg.norm(coefficients[cfg.n_directions :])),
+    }
+    for j in range(cfg.n_directions):
+        trajectory_row[f"lambda_{j+1}"] = float(eigenvalues[j])
+        trajectory_row[f"a{j+1}"] = float(coefficients[j])
+        trajectory_row[f"abs_a{j+1}"] = abs(float(coefficients[j]))
+
+    event_rows: List[Dict[str, object]] = []
+    for stage in range(1, cfg.n_directions + 1):
+        sidx = stage - 1
+        A_mask = accepted_T[sidx]
+        AC_mask = accepted_correct[sidx]
+
+        first_A = first_true_index(A_mask)
+        first_AC = first_true_index(AC_mask)
+        sustained_start, sustained_confirm = first_consecutive_true_run(
+            AC_mask, cfg.recovery_persistence_windows
+        )
+        last_AC = last_true_index(AC_mask)
+        latest_A = last_true_index(A_mask)
+
+        t_target = theoretical_pointwise_dominance_time(
+            eigenvalues=eigenvalues,
+            coefficients=coefficients,
+            stage_index0=sidx,
+            competitor_stop_exclusive=cfg.n_directions,
+        )
+        t_full = theoretical_pointwise_dominance_time(
+            eigenvalues=eigenvalues,
+            coefficients=coefficients,
+            stage_index0=sidx,
+            competitor_stop_exclusive=cfg.dim,
+        )
+
+        row: Dict[str, object] = {
+            "case_name": case_name,
+            "spectrum_case": spectrum_name,
+            "excitation_case": excitation_name,
+            "system_uid": system_uid,
+            "trajectory_uid": trajectory_uid,
+            "initial_state_within_system": state_index,
+            "stage": stage,
+            "target": f"q{stage}",
+            "target_lambda": float(eigenvalues[sidx]),
+            "target_abs_excitation": abs(float(coefficients[sidx])),
+            "ever_accepted": bool(np.any(A_mask)),
+            "ever_accepted_and_correct": bool(np.any(AC_mask)),
+            "ever_sustained_recovery": sustained_start is not None,
+            "n_accepted_windows": int(np.sum(A_mask)),
+            "n_accepted_correct_windows": int(np.sum(AC_mask)),
+            "theoretical_pointwise_dominance_time_target_modes": t_target,
+            "theoretical_pointwise_dominance_time_full_modes": t_full,
+            "first_accept_window_end": np.nan,
+            "first_accept_absolute_distance": np.nan,
+            "first_accept_relative_distance": np.nan,
+            "first_accept_log10_relative_distance": np.nan,
+            "first_accept_error_deg": np.nan,
+            "first_recovery_window_end": np.nan,
+            "first_recovery_absolute_distance": np.nan,
+            "first_recovery_relative_distance": np.nan,
+            "first_recovery_log10_relative_distance": np.nan,
+            "first_recovery_error_deg": np.nan,
+            "sustained_recovery_start_window_end": np.nan,
+            "sustained_recovery_confirm_window_end": np.nan,
+            "sustained_recovery_start_absolute_distance": np.nan,
+            "sustained_recovery_start_relative_distance": np.nan,
+            "sustained_recovery_start_log10_relative_distance": np.nan,
+            "sustained_recovery_start_error_deg": np.nan,
+            "last_recovery_window_end": np.nan,
+            "latest_accepted_window_end": np.nan,
+            "latest_accepted_error_deg": np.nan,
+            "reference_error_deg_at_first_accept": np.nan,
+            "estimated_minus_reference_penalty_deg_at_first_accept": np.nan,
+            "reference_error_deg_at_first_recovery": np.nan,
+            "estimated_minus_reference_penalty_deg_at_first_recovery": np.nan,
+            "reference_error_deg_at_sustained_start": np.nan,
+            "estimated_minus_reference_penalty_deg_at_sustained_start": np.nan,
+            "reference_error_deg_at_latest_accept": np.nan,
+            "estimated_minus_reference_penalty_deg_at_latest_accept": np.nan,
+        }
+
+        def fill_event(prefix: str, idx: Optional[int]) -> None:
+            if idx is None:
+                return
+            t = int(window_ends[idx])
+            rel = float(relative_distance[idx])
+            absolute = float(endpoint_distance[idx])
+            row[f"{prefix}_window_end"] = t
+            if f"{prefix}_absolute_distance" in row:
+                row[f"{prefix}_absolute_distance"] = absolute
+            if f"{prefix}_relative_distance" in row:
+                row[f"{prefix}_relative_distance"] = rel
+            if f"{prefix}_log10_relative_distance" in row:
+                row[f"{prefix}_log10_relative_distance"] = safe_log10(rel)
+            if f"{prefix}_error_deg" in row:
+                row[f"{prefix}_error_deg"] = float(errors[sidx, idx])
+
+        fill_event("first_accept", first_A)
+        fill_event("first_recovery", first_AC)
+        fill_event("sustained_recovery_start", sustained_start)
+        fill_event("last_recovery", last_AC)
+        fill_event("latest_accepted", latest_A)
+        if sustained_confirm is not None:
+            row["sustained_recovery_confirm_window_end"] = int(window_ends[sustained_confirm])
+
+        # Event-level same-window reference diagnostics. The reference never chooses a window.
+        for event_key, idx in (
+            ("first_accept", first_A),
+            ("first_recovery", first_AC),
+            ("sustained_start", sustained_start),
+            ("latest_accept", latest_A),
+        ):
+            ref_err, penalty = event_reference_metrics(
+                diagnostics=diagnostics,
+                X=X,
+                L=L,
+                true_basis=true_basis,
+                stage=stage,
+                diag_index=idx,
+            )
+            row[f"reference_error_deg_at_{event_key}"] = ref_err
+            row[f"estimated_minus_reference_penalty_deg_at_{event_key}"] = penalty
+
+        if sustained_start is not None and np.isfinite(t_full):
+            row["sustained_start_minus_theoretical_full_dominance_time"] = (
+                int(window_ends[sustained_start]) - t_full
+            )
+        else:
+            row["sustained_start_minus_theoretical_full_dominance_time"] = np.nan
+
+        event_rows.append(row)
+
+    traces = {
+        "window_start": window_starts,
+        "window_end": window_ends,
+        "accepted": accepted_T.astype(np.uint8),
+        "errors_deg": errors.astype(np.float32),
+        "accepted_correct": accepted_correct.astype(np.uint8),
+        "pc1_fraction": pc1.astype(np.float32),
+        "absolute_distance": endpoint_distance.astype(np.float64),
+        "relative_distance": relative_distance.astype(np.float64),
+    }
+    return trajectory_row, event_rows, traces
+
+
+def hierarchical_bootstrap_stat(
     frame: pd.DataFrame,
     value_col: str,
     n_boot: int,
     seed: int,
+    statistic: str = "mean",
 ) -> Dict[str, float]:
     data = frame[["system_uid", value_col]].dropna().copy()
     if data.empty:
@@ -284,18 +701,20 @@ def hierarchical_bootstrap_mean(
         sid: data.loc[data["system_uid"] == sid, value_col].astype(float).to_numpy()
         for sid in system_ids
     }
-    estimate = float(data[value_col].astype(float).mean())
+
+    def stat(values: np.ndarray) -> float:
+        return float(np.mean(values)) if statistic == "mean" else float(np.median(values))
+
+    estimate = stat(data[value_col].astype(float).to_numpy())
     rng = np.random.default_rng(seed)
     boot = np.empty(n_boot, dtype=float)
-
     for b in range(n_boot):
         sampled_systems = rng.choice(system_ids, size=len(system_ids), replace=True)
         chunks: List[np.ndarray] = []
         for sid in sampled_systems:
             values = grouped[sid]
-            sampled_values = rng.choice(values, size=len(values), replace=True)
-            chunks.append(np.asarray(sampled_values, dtype=float))
-        boot[b] = float(np.mean(np.concatenate(chunks)))
+            chunks.append(rng.choice(values, size=len(values), replace=True))
+        boot[b] = stat(np.concatenate(chunks))
 
     return {
         "estimate": estimate,
@@ -304,477 +723,225 @@ def hierarchical_bootstrap_mean(
     }
 
 
-def analyse_one_trajectory(
-    *,
-    cfg: ExperimentConfig,
-    estimator_cfg: EstimatorConfig,
-    A: np.ndarray,
-    true_basis: np.ndarray,
-    eigenvalues: np.ndarray,
-    system_replicate: int,
-    system_seed: int,
-    trial_within_system: int,
-    trial_seed: int,
-) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
-    x0, coefficients = construct_initial_state(cfg, true_basis, trial_seed)
-    X = simulate_trajectory(A=A, x0=x0, steps=cfg.steps)
-    L = np.zeros(cfg.dim, dtype=float)
-
-    # One observation-only rolling pass extracts up to k directions per window.
-    # Stage i acceptance is then defined by the prefix rule for directions 1...i.
-    diagnostics = rolling_same_window_diagnostics(X=X, L=L, cfg=estimator_cfg)
-
-    system_uid = "sys_%03d" % system_replicate
-    trajectory_uid = "%s_trial_%04d" % (system_uid, trial_within_system)
-
-    trajectory_row: Dict[str, object] = {
-        "system_uid": system_uid,
-        "trajectory_uid": trajectory_uid,
-        "system_replicate": system_replicate,
-        "system_seed": system_seed,
-        "initial_state_within_system": trial_within_system,
-        "trial_seed": trial_seed,
-        "x0_norm": float(np.linalg.norm(x0)),
-        "tail_coefficient_l2_norm": float(np.linalg.norm(coefficients[cfg.n_directions :])),
-    }
-    for j in range(cfg.n_directions):
-        trajectory_row[f"lambda_{j+1}"] = float(eigenvalues[j])
-        trajectory_row[f"a{j+1}"] = float(coefficients[j])
-        trajectory_row[f"abs_a{j+1}"] = abs(float(coefficients[j]))
-
-    stage_rows: List[Dict[str, object]] = []
-
-    for stage in range(1, cfg.n_directions + 1):
-        selected, n_candidates = select_prefix_window(
-            diagnostics=diagnostics,
-            cfg=estimator_cfg,
-            n_stages=stage,
-        )
-        accepted = selected is not None
+def summarize_case_stage(events: pd.DataFrame, cfg: ExperimentConfig) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    grouped = events.groupby(
+        ["spectrum_case", "excitation_case", "case_name", "stage"],
+        sort=True,
+    )
+    for gidx, (keys, group) in enumerate(grouped):
+        spectrum_name, excitation_name, case_name, stage = keys
+        work = group.copy()
+        for col in ("ever_accepted", "ever_accepted_and_correct", "ever_sustained_recovery"):
+            work[col + "_numeric"] = work[col].astype(float)
 
         row: Dict[str, object] = {
-            "system_uid": system_uid,
-            "trajectory_uid": trajectory_uid,
-            "system_replicate": system_replicate,
-            "initial_state_within_system": trial_within_system,
-            "stage": stage,
-            "target_name": f"q{stage}",
-            "target_lambda": float(eigenvalues[stage - 1]),
-            "target_abs_initial_excitation": abs(float(coefficients[stage - 1])),
-            "A_i_accepted": bool(accepted),
-            "n_acceptable_windows_for_prefix": int(n_candidates),
-            "selected_window_start": np.nan,
-            "selected_window_end": np.nan,
-            "C_i_correct": np.nan,
-            "A_i_and_C_i": False,
-            "A_i_and_not_C_i": False,
-            "q_i_error_deg": np.nan,
-            "all_prior_correct_same_stage_window": np.nan,
-            "any_prior_incorrect_same_stage_window": np.nan,
-            "n_prior_incorrect_same_stage_window": np.nan,
-            "reference_q_i_error_deg_same_window": np.nan,
-            "reference_q_i_correct_same_window": np.nan,
-            "estimated_rebuilt_q_i_error_deg_same_window": np.nan,
-            "estimated_vs_reference_error_penalty_deg": np.nan,
-            "reference_stage_pc1_energy_fraction_same_window": np.nan,
-            "reference_stage_singular_value_ratio_same_window": np.nan,
-            "estimated_vs_reference_residual_relative_fro_difference": np.nan,
-        }
-
-        # Store all target excitations to permit later propagation/excitation auditing.
-        for j in range(cfg.n_directions):
-            row[f"abs_a{j+1}"] = abs(float(coefficients[j]))
-
-        if not accepted:
-            stage_rows.append(row)
-            trajectory_row[f"A{stage}_accepted"] = False
-            trajectory_row[f"C{stage}_correct"] = np.nan
-            continue
-
-        window_start = int(selected["window_start"])
-        window_end = int(selected["window_end"])
-        row["selected_window_start"] = window_start
-        row["selected_window_end"] = window_end
-
-        # Correctness is evaluated for every member of the ACTUAL prefix chain
-        # at this same selected stage-i window. This is what propagated into qhat_i.
-        selected_dirs: List[np.ndarray] = []
-        chain_correctness: List[bool] = []
-        chain_errors: List[float] = []
-        for j in range(1, stage + 1):
-            direction_obj = selected[f"direction_{j}"]
-            if direction_obj is None:
-                raise RuntimeError("Prefix selection accepted a missing direction.")
-            u_j = normalize(np.asarray(direction_obj, dtype=float))
-            selected_dirs.append(u_j)
-            err_j = angle_deg(u_j, true_basis[:, j - 1])
-            chain_errors.append(float(err_j))
-            chain_correctness.append(bool(err_j <= cfg.recovery_tolerance_deg))
-            row[f"q{j}_error_deg_at_stage_i_window"] = float(err_j)
-            row[f"C{j}_at_stage_i_window"] = bool(chain_correctness[-1])
-
-        q_i_error = chain_errors[-1]
-        C_i = correctness_value(True, q_i_error, cfg.recovery_tolerance_deg)
-        row["q_i_error_deg"] = q_i_error
-        row["C_i_correct"] = bool_or_nan(C_i)
-        row["A_i_and_C_i"] = bool(C_i is True)
-        row["A_i_and_not_C_i"] = bool(C_i is False)
-
-        if stage == 1:
-            row["all_prior_correct_same_stage_window"] = True
-            row["any_prior_incorrect_same_stage_window"] = False
-            row["n_prior_incorrect_same_stage_window"] = 0
-        else:
-            prior = chain_correctness[:-1]
-            row["all_prior_correct_same_stage_window"] = bool(all(prior))
-            row["any_prior_incorrect_same_stage_window"] = bool(not all(prior))
-            row["n_prior_incorrect_same_stage_window"] = int(sum(not x for x in prior))
-
-        # Same raw observation-only-selected window for estimated and reference chains.
-        R = X[window_start : window_end + 1] - L
-        estimated_prior_basis = orthonormal_basis(selected_dirs[:-1], cfg.dim)
-        reference_prior_basis = true_basis[:, : stage - 1]
-        R_est = deflate_by_basis(R, estimated_prior_basis)
-        R_ref = deflate_by_basis(R, reference_prior_basis)
-
-        rebuilt_u_i, _est_pc1, _est_ratio = top_right_singular_direction(R_est)
-        reference_u_i, ref_pc1, ref_ratio = top_right_singular_direction(R_ref)
-
-        if np.all(np.isfinite(rebuilt_u_i)):
-            rebuilt_error = angle_deg(rebuilt_u_i, true_basis[:, stage - 1])
-            row["estimated_rebuilt_q_i_error_deg_same_window"] = float(rebuilt_error)
-            # The rebuilt cumulative-projector version should reproduce the estimator.
-            mismatch = angle_deg(rebuilt_u_i, selected_dirs[-1])
-            row["estimator_vs_rebuilt_direction_mismatch_deg"] = float(mismatch)
-            if mismatch > 1e-4:
-                raise RuntimeError(
-                    "Estimated cumulative deflation did not reproduce the estimator "
-                    f"at stage {stage}: mismatch={mismatch:.6g} deg"
-                )
-
-        if np.all(np.isfinite(reference_u_i)):
-            reference_error = angle_deg(reference_u_i, true_basis[:, stage - 1])
-            row["reference_q_i_error_deg_same_window"] = float(reference_error)
-            row["reference_q_i_correct_same_window"] = bool(
-                reference_error <= cfg.recovery_tolerance_deg
-            )
-            row["reference_stage_pc1_energy_fraction_same_window"] = float(ref_pc1)
-            row["reference_stage_singular_value_ratio_same_window"] = float(ref_ratio)
-            row["estimated_vs_reference_error_penalty_deg"] = float(
-                q_i_error - reference_error
-            )
-
-        ref_norm = float(np.linalg.norm(R_ref, ord="fro"))
-        if ref_norm > EPS:
-            row["estimated_vs_reference_residual_relative_fro_difference"] = float(
-                np.linalg.norm(R_est - R_ref, ord="fro") / ref_norm
-            )
-
-        # Preserve the observation-only internal diagnostics at this selected prefix window.
-        for j in range(1, stage + 1):
-            for name in (
-                "direction_change_deg",
-                "stage_pc1_energy_fraction",
-                "singular_value_ratio_1_to_2",
-                "residual_energy_before_fraction",
-                "residual_energy_after_fraction",
-                "extracted_energy_fraction_original",
-            ):
-                key = f"stage_{j}_{name}"
-                row[f"selected_{key}"] = float(selected[key])
-
-        stage_rows.append(row)
-        trajectory_row[f"A{stage}_accepted"] = True
-        trajectory_row[f"C{stage}_correct"] = bool_or_nan(C_i)
-        trajectory_row[f"q{stage}_error_deg"] = q_i_error
-        trajectory_row[f"stage{stage}_selected_window_end"] = window_end
-
-    return trajectory_row, stage_rows
-
-
-def summarize_by_stage(
-    stage_results: pd.DataFrame,
-    cfg: ExperimentConfig,
-) -> pd.DataFrame:
-    rows: List[Dict[str, object]] = []
-    for stage, group in stage_results.groupby("stage", sort=True):
-        work = group.copy()
-        work["reliability_value"] = np.where(
-            work["A_i_accepted"].astype(bool),
-            pd.to_numeric(work["C_i_correct"], errors="coerce"),
-            np.nan,
-        )
-        metrics = {
-            "acceptance": "A_i_accepted",
-            "overall_recovery": "A_i_and_C_i",
-            "reliability_given_accepted": "reliability_value",
-            "false_acceptance": "A_i_and_not_C_i",
-        }
-        result: Dict[str, object] = {
+            "spectrum_case": spectrum_name,
+            "excitation_case": excitation_name,
+            "case_name": case_name,
             "stage": int(stage),
             "target": f"q{int(stage)}",
             "n_systems": int(group["system_uid"].nunique()),
+            "n_initial_states_per_system": cfg.initial_states_per_system,
             "n_trajectories": int(len(group)),
-            "n_accepted": int(group["A_i_accepted"].astype(bool).sum()),
         }
-        for j, (label, col) in enumerate(metrics.items()):
-            boot = hierarchical_bootstrap_mean(
+
+        rate_specs = [
+            ("ever_acceptance", "ever_accepted_numeric"),
+            ("ever_recovery", "ever_accepted_and_correct_numeric"),
+            ("sustained_recovery", "ever_sustained_recovery_numeric"),
+        ]
+        for midx, (label, col) in enumerate(rate_specs):
+            boot = hierarchical_bootstrap_stat(
                 work,
                 col,
                 cfg.bootstrap_replicates,
-                cfg.seed + 100_000 * int(stage) + 997 * j,
+                cfg.seed + gidx * 10000 + midx * 101,
+                statistic="mean",
             )
-            result[f"{label}_rate"] = boot["estimate"]
-            result[f"{label}_ci95_low"] = boot["ci95_low"]
-            result[f"{label}_ci95_high"] = boot["ci95_high"]
+            row[label + "_rate"] = boot["estimate"]
+            row[label + "_ci95_low"] = boot["ci95_low"]
+            row[label + "_ci95_high"] = boot["ci95_high"]
 
-        accepted = work.loc[work["A_i_accepted"].astype(bool)].copy()
-        result["median_q_i_error_deg_accepted"] = (
-            float(accepted["q_i_error_deg"].median()) if len(accepted) else np.nan
-        )
-        result["q25_q_i_error_deg_accepted"] = (
-            float(accepted["q_i_error_deg"].quantile(0.25)) if len(accepted) else np.nan
-        )
-        result["q75_q_i_error_deg_accepted"] = (
-            float(accepted["q_i_error_deg"].quantile(0.75)) if len(accepted) else np.nan
-        )
-        result["median_selected_window_end"] = (
-            float(accepted["selected_window_end"].median()) if len(accepted) else np.nan
-        )
-        rows.append(result)
-    return pd.DataFrame(rows).sort_values("stage")
+        sustained = work.loc[work["ever_sustained_recovery"].astype(bool)].copy()
+        accepted = work.loc[work["ever_accepted"].astype(bool)].copy()
+        recovered = work.loc[work["ever_accepted_and_correct"].astype(bool)].copy()
+
+        row["median_first_accept_window_end"] = float(accepted["first_accept_window_end"].median()) if len(accepted) else np.nan
+        row["median_first_recovery_window_end"] = float(recovered["first_recovery_window_end"].median()) if len(recovered) else np.nan
+        row["median_sustained_recovery_start_window_end"] = float(sustained["sustained_recovery_start_window_end"].median()) if len(sustained) else np.nan
+        row["q25_sustained_recovery_start_window_end"] = float(sustained["sustained_recovery_start_window_end"].quantile(0.25)) if len(sustained) else np.nan
+        row["q75_sustained_recovery_start_window_end"] = float(sustained["sustained_recovery_start_window_end"].quantile(0.75)) if len(sustained) else np.nan
+        row["median_sustained_recovery_confirm_window_end"] = float(sustained["sustained_recovery_confirm_window_end"].median()) if len(sustained) else np.nan
+        row["median_absolute_distance_at_sustained_start"] = float(sustained["sustained_recovery_start_absolute_distance"].median()) if len(sustained) else np.nan
+        row["median_relative_distance_at_sustained_start"] = float(sustained["sustained_recovery_start_relative_distance"].median()) if len(sustained) else np.nan
+        row["median_log10_relative_distance_at_sustained_start"] = float(sustained["sustained_recovery_start_log10_relative_distance"].median()) if len(sustained) else np.nan
+        row["q25_log10_relative_distance_at_sustained_start"] = float(sustained["sustained_recovery_start_log10_relative_distance"].quantile(0.25)) if len(sustained) else np.nan
+        row["q75_log10_relative_distance_at_sustained_start"] = float(sustained["sustained_recovery_start_log10_relative_distance"].quantile(0.75)) if len(sustained) else np.nan
+        row["median_latest_accepted_error_deg"] = float(accepted["latest_accepted_error_deg"].median()) if len(accepted) else np.nan
+        row["median_theoretical_full_dominance_time"] = float(work["theoretical_pointwise_dominance_time_full_modes"].replace([np.inf, -np.inf], np.nan).median())
+        row["median_sustained_minus_theoretical_full_time"] = float(sustained["sustained_start_minus_theoretical_full_dominance_time"].median()) if len(sustained) else np.nan
+        row["median_reference_error_at_sustained_start_deg"] = float(sustained["reference_error_deg_at_sustained_start"].median()) if len(sustained) else np.nan
+        row["median_estimated_minus_reference_penalty_at_sustained_start_deg"] = float(sustained["estimated_minus_reference_penalty_deg_at_sustained_start"].median()) if len(sustained) else np.nan
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values(["spectrum_case", "excitation_case", "stage"])
 
 
-def build_propagation_summary(
-    stage_results: pd.DataFrame,
-    cfg: ExperimentConfig,
+def summarize_time_case(
+    *,
+    spectrum_name: str,
+    excitation_name: str,
+    window_ends: np.ndarray,
+    accepted: np.ndarray,
+    errors: np.ndarray,
+    accepted_correct: np.ndarray,
+    relative_distance: np.ndarray,
 ) -> pd.DataFrame:
     """
-    Main propagation test.
-
-    Compare stage-i correctness among accepted prefix chains where all preceding
-    directions were correct at the SAME stage-i selected window versus accepted
-    chains where at least one preceding direction was incorrect.
+    Inputs have shapes:
+      accepted/errors/accepted_correct: [n_traj, n_stage, n_window]
+      relative_distance: [n_traj, n_window]
     """
+    n_traj, n_stage, n_window = accepted.shape
     rows: List[Dict[str, object]] = []
-    for stage in range(2, cfg.n_directions + 1):
-        accepted = stage_results.loc[
-            (stage_results["stage"] == stage)
-            & stage_results["A_i_accepted"].astype(bool)
-        ].copy()
-
-        for condition, mask in (
-            (
-                "all_prior_correct",
-                accepted["all_prior_correct_same_stage_window"] == True,
-            ),
-            (
-                "any_prior_incorrect",
-                accepted["any_prior_incorrect_same_stage_window"] == True,
-            ),
-        ):
-            group = accepted.loc[mask].copy()
-            row: Dict[str, object] = {
-                "stage": stage,
-                "target": f"q{stage}",
-                "preceding_chain_condition": condition,
-                "n_systems": int(group["system_uid"].nunique()) if len(group) else 0,
-                "n_trajectories": int(len(group)),
-                "stage_i_correct_rate": np.nan,
-                "stage_i_correct_ci95_low": np.nan,
-                "stage_i_correct_ci95_high": np.nan,
-                "reference_correct_rate_same_window": np.nan,
-                "median_q_i_error_deg": np.nan,
-                "median_reference_q_i_error_deg_same_window": np.nan,
-                "median_estimated_minus_reference_error_penalty_deg": np.nan,
-            }
-            if len(group):
-                group["C_i_numeric"] = pd.to_numeric(group["C_i_correct"], errors="coerce")
-                boot = hierarchical_bootstrap_mean(
-                    group,
-                    "C_i_numeric",
-                    cfg.bootstrap_replicates,
-                    cfg.seed + 1_000_000 * stage + (1 if condition == "all_prior_correct" else 2),
-                )
-                row["stage_i_correct_rate"] = boot["estimate"]
-                row["stage_i_correct_ci95_low"] = boot["ci95_low"]
-                row["stage_i_correct_ci95_high"] = boot["ci95_high"]
-                row["reference_correct_rate_same_window"] = float(
-                    pd.to_numeric(
-                        group["reference_q_i_correct_same_window"], errors="coerce"
-                    ).mean()
-                )
-                row["median_q_i_error_deg"] = float(group["q_i_error_deg"].median())
-                row["median_reference_q_i_error_deg_same_window"] = float(
-                    group["reference_q_i_error_deg_same_window"].median()
-                )
-                row["median_estimated_minus_reference_error_penalty_deg"] = float(
-                    group["estimated_vs_reference_error_penalty_deg"].median()
-                )
-            rows.append(row)
+    for sidx in range(n_stage):
+        for widx in range(n_window):
+            A = accepted[:, sidx, widx].astype(bool)
+            AC = accepted_correct[:, sidx, widx].astype(bool)
+            e = errors[:, sidx, widx]
+            accepted_errors = e[A & np.isfinite(e)]
+            reliability = float(np.mean(AC[A])) if np.any(A) else np.nan
+            rows.append({
+                "spectrum_case": spectrum_name,
+                "excitation_case": excitation_name,
+                "case_name": f"{spectrum_name}__{excitation_name}",
+                "stage": sidx + 1,
+                "target": f"q{sidx+1}",
+                "window_end": int(window_ends[widx]),
+                "acceptance_rate": float(np.mean(A)),
+                "successful_recovery_rate": float(np.mean(AC)),
+                "reliability_given_accepted": reliability,
+                "median_error_deg_accepted": float(np.median(accepted_errors)) if len(accepted_errors) else np.nan,
+                "q25_error_deg_accepted": float(np.quantile(accepted_errors, 0.25)) if len(accepted_errors) else np.nan,
+                "q75_error_deg_accepted": float(np.quantile(accepted_errors, 0.75)) if len(accepted_errors) else np.nan,
+                "median_relative_distance_to_limit": float(np.nanmedian(relative_distance[:, widx])),
+                "median_log10_relative_distance_to_limit": float(np.nanmedian([safe_log10(v) for v in relative_distance[:, widx]])),
+                "n_trajectories": n_traj,
+            })
     return pd.DataFrame(rows)
 
 
-def build_reference_comparison(stage_results: pd.DataFrame) -> pd.DataFrame:
-    accepted = stage_results.loc[stage_results["A_i_accepted"].astype(bool)].copy()
-    rows: List[Dict[str, object]] = []
-    for stage, group in accepted.groupby("stage", sort=True):
-        evaluable = group.loc[group["reference_q_i_error_deg_same_window"].notna()].copy()
-        rows.append({
-            "stage": int(stage),
-            "target": f"q{int(stage)}",
-            "n_accepted": int(len(group)),
-            "n_reference_evaluable": int(len(evaluable)),
-            "median_estimated_q_i_error_deg": float(group["q_i_error_deg"].median()) if len(group) else np.nan,
-            "median_reference_q_i_error_deg_same_window": float(evaluable["reference_q_i_error_deg_same_window"].median()) if len(evaluable) else np.nan,
-            "median_estimated_minus_reference_error_penalty_deg": float(evaluable["estimated_vs_reference_error_penalty_deg"].median()) if len(evaluable) else np.nan,
-            "estimated_correct_rate": float(pd.to_numeric(group["C_i_correct"], errors="coerce").mean()) if len(group) else np.nan,
-            "reference_correct_rate_same_window": float(pd.to_numeric(evaluable["reference_q_i_correct_same_window"], errors="coerce").mean()) if len(evaluable) else np.nan,
-        })
-    return pd.DataFrame(rows).sort_values("stage")
-
-
 def build_design_table(cfg: ExperimentConfig) -> pd.DataFrame:
-    return pd.DataFrame([{
-        "system_type": "linear normal; real orthogonal eigendirections",
-        "dimension": cfg.dim,
-        "steps": cfg.steps,
-        "window_m": cfg.window,
-        "n_directions": cfg.n_directions,
-        "leading_eigenvalues": ",".join("%+.4f" % v for v in cfg.leading_eigenvalues),
-        "system_replicates": cfg.system_replicates,
-        "initial_states_per_system": cfg.initial_states_per_system,
-        "total_trajectories": cfg.system_replicates * cfg.initial_states_per_system,
-        "q1_excitation_magnitude": 1.0,
-        "q2_to_qk_excitation_distribution": (
-            "independent log-uniform[%g,%g], random sign"
-            % (cfg.leading_excitation_min, cfg.leading_excitation_max)
-        ),
-        "tail_coefficient_scale": cfg.tail_coefficient_scale,
-        "stability_threshold_deg": cfg.stability_threshold_deg,
-        "stability_patience": cfg.stability_patience,
-        "pc1_energy_threshold": cfg.min_stage_pc1_energy_fraction,
-        "external_tolerance_deg": cfg.recovery_tolerance_deg,
-    }])
+    rows: List[Dict[str, object]] = []
+    for spectrum_name, spectrum in SPECTRUM_CASES.items():
+        for excitation_name, excitation in EXCITATION_PROFILES.items():
+            rows.append({
+                "case_name": f"{spectrum_name}__{excitation_name}",
+                "spectrum_case": spectrum_name,
+                "leading_eigenvalues": ",".join("%g" % v for v in spectrum),
+                "excitation_case": excitation_name,
+                "target_excitation_magnitudes": ",".join("%g" % v for v in excitation),
+                "n_systems": cfg.system_replicates,
+                "initial_states_per_system": cfg.initial_states_per_system,
+                "trajectories_per_case": cfg.system_replicates * cfg.initial_states_per_system,
+                "window_m": cfg.window,
+                "steps": cfg.steps,
+                "stability_threshold_deg": cfg.stability_threshold_deg,
+                "stability_patience": cfg.stability_patience,
+                "pc1_energy_threshold": cfg.min_stage_pc1_energy_fraction,
+                "external_correctness_tolerance_deg": cfg.recovery_tolerance_deg,
+                "sustained_recovery_persistence_windows": cfg.recovery_persistence_windows,
+            })
+    return pd.DataFrame(rows)
 
 
-def plot_stage_rates(summary: pd.DataFrame, output_path: Path) -> None:
-    x = summary["stage"].to_numpy(dtype=int)
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.plot(x, summary["acceptance_rate"], marker="o", label=r"$P(A_i=1)$")
-    ax.plot(x, summary["overall_recovery_rate"], marker="o", label=r"$P(A_i=1,C_i=1)$")
-    ax.plot(x, summary["reliability_given_accepted_rate"], marker="o", label=r"$P(C_i=1\mid A_i=1)$")
-    ax.plot(x, summary["false_acceptance_rate"], marker="o", label=r"$P(A_i=1,C_i=0)$")
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"q{i}" for i in x])
-    ax.set_ylim(-0.02, 1.02)
-    ax.set_xlabel("Filter stage")
-    ax.set_ylabel("Rate")
-    ax.set_title("Experiment 3: stage-wise multi-filter outcomes")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
+def plot_case_stage_heatmap(
+    summary: pd.DataFrame,
+    value_col: str,
+    title: str,
+    cbar_label: str,
+    output_path: Path,
+    fmt: str = ".2f",
+) -> None:
+    order = [f"{s}__{a}" for s in SPECTRUM_CASES for a in EXCITATION_PROFILES]
+    pivot = summary.pivot(index="case_name", columns="stage", values=value_col).reindex(order)
+    arr = pivot.to_numpy(dtype=float)
+
+    fig, ax = plt.subplots(figsize=(10, 9))
+    image = ax.imshow(arr, aspect="auto")
+    ax.set_xticks(np.arange(len(pivot.columns)))
+    ax.set_xticklabels([f"q{int(v)}" for v in pivot.columns])
+    ax.set_yticks(np.arange(len(pivot.index)))
+    ax.set_yticklabels(list(pivot.index))
+    ax.set_xlabel("Direction")
+    ax.set_ylabel("Spectrum / excitation case")
+    ax.set_title(title)
+    for i in range(arr.shape[0]):
+        for j in range(arr.shape[1]):
+            if np.isfinite(arr[i, j]):
+                ax.text(j, i, format(arr[i, j], fmt), ha="center", va="center")
+    cb = fig.colorbar(image, ax=ax)
+    cb.set_label(cbar_label)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
 
-def plot_propagation(propagation: pd.DataFrame, output_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(9, 6))
-    stages = sorted(propagation["stage"].unique())
-    for condition, label in (
-        ("all_prior_correct", "all preceding accepted directions correct"),
-        ("any_prior_incorrect", "at least one preceding accepted direction incorrect"),
-    ):
-        subset = propagation.loc[
-            propagation["preceding_chain_condition"] == condition
-        ].sort_values("stage")
-        ax.plot(
-            subset["stage"],
-            subset["stage_i_correct_rate"],
-            marker="o",
-            label=label,
-        )
-    ax.set_xticks(stages)
-    ax.set_xticklabels([f"q{i}" for i in stages])
-    ax.set_ylim(-0.02, 1.02)
-    ax.set_xlabel("Current filter stage")
-    ax.set_ylabel(r"$P(C_i=1\mid A_1=\cdots=A_i=1,\;\mathrm{prior\ condition})$")
-    ax.set_title("Experiment 3: propagation of preceding-direction errors")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def plot_reference_penalty(reference: pd.DataFrame, output_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.plot(
-        reference["stage"],
-        reference["median_estimated_minus_reference_error_penalty_deg"],
-        marker="o",
-    )
-    ax.axhline(0.0, linewidth=1.0)
-    ax.set_xticks(reference["stage"])
-    ax.set_xticklabels([f"q{i}" for i in reference["stage"]])
-    ax.set_xlabel("Filter stage")
-    ax.set_ylabel("median estimated error - reference-deflation error (degrees)")
-    ax.set_title("Experiment 3: error attributable to estimated preceding deflation")
-    ax.grid(True, alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def plot_error_distribution(stage_results: pd.DataFrame, cfg: ExperimentConfig, output_path: Path) -> None:
-    data = []
-    labels = []
-    for stage in range(1, cfg.n_directions + 1):
-        values = stage_results.loc[
-            (stage_results["stage"] == stage)
-            & stage_results["A_i_accepted"].astype(bool),
-            "q_i_error_deg",
-        ].dropna().to_numpy(dtype=float)
-        if len(values):
-            data.append(values)
-            labels.append(f"q{stage}")
-    if not data:
+def plot_time_curves_for_case(
+    time_summary: pd.DataFrame,
+    case_name: str,
+    output_dir: Path,
+    recovery_tolerance_deg: float,
+) -> None:
+    case = time_summary.loc[time_summary["case_name"] == case_name].copy()
+    if case.empty:
         return
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.boxplot(data, labels=labels, showfliers=False)
-    ax.axhline(cfg.recovery_tolerance_deg, linestyle="--", linewidth=1.0)
-    ax.set_yscale("log")
-    ax.set_xlabel("Filter stage")
-    ax.set_ylabel("Angular error among accepted estimates (degrees, log scale)")
-    ax.set_title("Experiment 3: accepted-direction angular errors")
+
+    # Successful recovery probability over iteration.
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for stage, g in case.groupby("stage", sort=True):
+        g = g.sort_values("window_end")
+        ax.plot(g["window_end"], g["successful_recovery_rate"], label=f"q{int(stage)}")
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("Window-end iteration")
+    ax.set_ylabel(r"$P(A_i(t)=1, C_i(t)=1)$")
+    ax.set_title(f"Time-resolved successful recovery: {case_name}")
     ax.grid(True, alpha=0.25)
+    ax.legend()
     fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
+    fig.savefig(output_dir / f"{case_name}__recovery_probability_vs_iteration.png", dpi=180)
+    plt.close(fig)
+
+    # Median accepted angular error over iteration.
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for stage, g in case.groupby("stage", sort=True):
+        g = g.sort_values("window_end")
+        ax.plot(g["window_end"], g["median_error_deg_accepted"], label=f"q{int(stage)}")
+    ax.axhline(recovery_tolerance_deg, linestyle="--", linewidth=1.0)
+    ax.set_xlabel("Window-end iteration")
+    ax.set_ylabel("Median angular error among accepted estimates (degrees)")
+    ax.set_title(f"Accepted-direction error over iteration: {case_name}")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / f"{case_name}__accepted_error_vs_iteration.png", dpi=180)
     plt.close(fig)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Framework Experiment 3: multi-filter error propagation in normal linear "
-            "systems. Stage-i propagation is evaluated using correctness of preceding "
-            "directions at the same observation-only selected stage-i window."
+            "Redesigned Framework Experiment 3: time-resolved q1...q5 recovery "
+            "across three spectra and five controlled excitation profiles."
         )
     )
     parser.add_argument("--dim", type=int, default=20)
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--window", type=int, default=20)
-    parser.add_argument("--n-directions", type=int, default=5)
-    parser.add_argument(
-        "--leading-eigenvalues",
-        type=parse_float_list,
-        default=parse_float_list("0.96,0.95,0.94,0.93,0.92"),
-    )
     parser.add_argument("--system-replicates", type=int, default=10)
     parser.add_argument("--initial-states-per-system", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--leading-excitation-min", type=float, default=1e-3)
-    parser.add_argument("--leading-excitation-max", type=float, default=3.0)
     parser.add_argument("--tail-coefficient-scale", type=float, default=0.10)
     parser.add_argument("--tail-max", type=float, default=0.90)
     parser.add_argument("--tail-min", type=float, default=0.20)
@@ -785,12 +952,14 @@ def main() -> None:
     parser.add_argument("--min-residual-energy-fraction", type=float, default=1e-10)
     parser.add_argument("--numeric-relative-residual-floor", type=float, default=1e-15)
     parser.add_argument("--min-stage-pc1-energy-fraction", type=float, default=0.80)
-    parser.add_argument("--recovery-tolerance-deg", type=float, default=1.0)
+    parser.add_argument("--recovery-tolerance-deg", type=float, default=2.5)
+    parser.add_argument("--recovery-persistence-windows", type=int, default=5)
     parser.add_argument("--bootstrap-replicates", type=int, default=2000)
+    parser.add_argument("--no-trace-npz", action="store_true")
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("results/framework_experiment3_multifilter_propagation_normal"),
+        default=Path("results/framework_experiment3_spectrum_excitation_time_resolved"),
     )
     args = parser.parse_args()
 
@@ -798,13 +967,10 @@ def main() -> None:
         dim=args.dim,
         steps=args.steps,
         window=args.window,
-        n_directions=args.n_directions,
-        leading_eigenvalues=tuple(args.leading_eigenvalues),
+        n_directions=5,
         system_replicates=args.system_replicates,
         initial_states_per_system=args.initial_states_per_system,
         seed=args.seed,
-        leading_excitation_min=args.leading_excitation_min,
-        leading_excitation_max=args.leading_excitation_max,
         tail_coefficient_scale=args.tail_coefficient_scale,
         tail_max=args.tail_max,
         tail_min=args.tail_min,
@@ -816,130 +982,283 @@ def main() -> None:
         numeric_relative_residual_floor=args.numeric_relative_residual_floor,
         min_stage_pc1_energy_fraction=args.min_stage_pc1_energy_fraction,
         recovery_tolerance_deg=args.recovery_tolerance_deg,
+        recovery_persistence_windows=args.recovery_persistence_windows,
         bootstrap_replicates=args.bootstrap_replicates,
+        save_trace_npz=not args.no_trace_npz,
     )
     validate_config(cfg)
     estimator_cfg = make_estimator_config(cfg)
 
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
+    traces_dir = output / "time_traces"
+    curves_dir = output / "time_curves"
+    traces_dir.mkdir(parents=True, exist_ok=True)
+    curves_dir.mkdir(parents=True, exist_ok=True)
+
     config_json = asdict(cfg)
-    config_json["leading_eigenvalues"] = list(cfg.leading_eigenvalues)
+    config_json["spectrum_cases"] = {k: list(v) for k, v in SPECTRUM_CASES.items()}
+    config_json["excitation_profiles"] = {k: list(v) for k, v in EXCITATION_PROFILES.items()}
+    config_json["trajectories_per_case"] = cfg.system_replicates * cfg.initial_states_per_system
+    config_json["n_cases"] = len(SPECTRUM_CASES) * len(EXCITATION_PROFILES)
+    config_json["total_trajectories"] = (
+        len(SPECTRUM_CASES)
+        * len(EXCITATION_PROFILES)
+        * cfg.system_replicates
+        * cfg.initial_states_per_system
+    )
     config_json["estimator_config_fields_detected"] = [f.name for f in fields(EstimatorConfig)]
     with (output / "experiment_config.json").open("w", encoding="utf-8") as f:
         json.dump(config_json, f, indent=2)
 
-    total = cfg.system_replicates * cfg.initial_states_per_system
-    print("============================================================")
-    print("Framework Experiment 3: multi-filter propagation, normal system")
-    print("============================================================")
+    design = build_design_table(cfg)
+    design.to_csv(output / "table1_experiment_design.csv", index=False)
+
+    total_cases = len(SPECTRUM_CASES) * len(EXCITATION_PROFILES)
+    trajectories_per_case = cfg.system_replicates * cfg.initial_states_per_system
+    total_trajectories = total_cases * trajectories_per_case
+
+    print("================================================================")
+    print("Framework Experiment 3: spectrum x excitation x recovery time")
+    print("================================================================")
     print("dimension:", cfg.dim)
     print("steps:", cfg.steps)
     print("window:", cfg.window)
-    print("n directions:", cfg.n_directions)
-    print("leading eigenvalues:", cfg.leading_eigenvalues)
-    print("systems:", cfg.system_replicates)
-    print("initial states per system:", cfg.initial_states_per_system)
-    print("total trajectories:", total)
-    print(
-        "leading excitations: q1=1; q2...qk log-uniform in "
-        f"[{cfg.leading_excitation_min:g}, {cfg.leading_excitation_max:g}]"
-    )
-    print("All target modes are nonzero; no target-absence cases are used.")
-    print("References are used only after the observation-only window is selected.")
-    print("============================================================")
+    print("directions: q1...q5")
+    print("spectrum cases:")
+    for k, v in SPECTRUM_CASES.items():
+        print("  ", k, v)
+    print("excitation profiles |a_i|:")
+    for k, v in EXCITATION_PROFILES.items():
+        print("  ", k, v)
+    print("systems per case:", cfg.system_replicates)
+    print("initial states per system per case:", cfg.initial_states_per_system)
+    print("trajectories per case:", trajectories_per_case)
+    print("number of cases:", total_cases)
+    print("TOTAL trajectories:", total_trajectories)
+    print("external correctness tolerance:", cfg.recovery_tolerance_deg, "degrees")
+    print("sustained recovery persistence:", cfg.recovery_persistence_windows, "windows")
+    print("References never select windows; they are evaluated only at observation-only event windows.")
+    print("================================================================")
 
-    trajectory_rows: List[Dict[str, object]] = []
-    stage_rows: List[Dict[str, object]] = []
-    system_rows: List[Dict[str, object]] = []
+    all_trajectory_rows: List[Dict[str, object]] = []
+    all_event_rows: List[Dict[str, object]] = []
+    all_system_rows: List[Dict[str, object]] = []
+    all_time_summary: List[pd.DataFrame] = []
 
-    completed = 0
-    for rep in range(cfg.system_replicates):
-        system_seed = cfg.seed + 1_000_000 * rep
-        A, Q, eigenvalues, normality_error = build_random_normal_system(cfg, system_seed)
-        system_uid = "sys_%03d" % rep
-        system_rows.append({
-            "system_uid": system_uid,
-            "system_replicate": rep,
-            "system_seed": system_seed,
-            "normality_error": normality_error,
-            "leading_eigenvalues_json": json.dumps(eigenvalues[: cfg.n_directions].tolist()),
-            "tail_max_abs_eigenvalue": float(np.max(np.abs(eigenvalues[cfg.n_directions :]))),
-            "tail_eigenvalues_json": json.dumps(eigenvalues[cfg.n_directions :].tolist()),
-        })
-
-        for trial in range(cfg.initial_states_per_system):
-            trial_seed = cfg.seed + 10_000_000 * rep + trial
-            traj_row, rows = analyse_one_trajectory(
+    # Pre-build the 10 paired systems for each spectrum. System seed depends only
+    # on replicate, so Q is paired across spectral cases.
+    systems_by_spectrum: Dict[str, List[Tuple[np.ndarray, np.ndarray, np.ndarray, float, int]]] = {}
+    for spectrum_name, spectrum in SPECTRUM_CASES.items():
+        systems_by_spectrum[spectrum_name] = []
+        for rep in range(cfg.system_replicates):
+            system_seed = cfg.seed + 100_000 * rep
+            A, Q, eigenvalues, normality_error = build_random_normal_system(
                 cfg=cfg,
-                estimator_cfg=estimator_cfg,
-                A=A,
-                true_basis=Q,
-                eigenvalues=eigenvalues,
-                system_replicate=rep,
+                leading_eigenvalues=spectrum,
                 system_seed=system_seed,
-                trial_within_system=trial,
-                trial_seed=trial_seed,
             )
-            trajectory_rows.append(traj_row)
-            stage_rows.extend(rows)
-            completed += 1
+            systems_by_spectrum[spectrum_name].append(
+                (A, Q, eigenvalues, normality_error, system_seed)
+            )
+            all_system_rows.append({
+                "spectrum_case": spectrum_name,
+                "system_uid": f"{spectrum_name}_sys_{rep:02d}",
+                "paired_system_replicate": rep,
+                "system_seed": system_seed,
+                "leading_eigenvalues_json": json.dumps(list(spectrum)),
+                "normality_error": normality_error,
+                "tail_max_abs_eigenvalue": float(np.max(np.abs(eigenvalues[cfg.n_directions :]))),
+                "tail_eigenvalues_json": json.dumps(eigenvalues[cfg.n_directions :].tolist()),
+            })
 
-        print(f"completed system {rep + 1}/{cfg.system_replicates}; {completed}/{total} trajectories")
+    case_counter = 0
+    completed_total = 0
+    acceptance_verified_once = False
 
-    trajectories = pd.DataFrame(trajectory_rows)
-    stage_results = pd.DataFrame(stage_rows)
-    systems = pd.DataFrame(system_rows)
+    for spectrum_name, spectrum in SPECTRUM_CASES.items():
+        for excitation_name, excitation_profile in EXCITATION_PROFILES.items():
+            case_counter += 1
+            case_name = f"{spectrum_name}__{excitation_name}"
+            print(f"\n--- Case {case_counter}/{total_cases}: {case_name} ---")
+
+            case_accepted: List[np.ndarray] = []
+            case_errors: List[np.ndarray] = []
+            case_accepted_correct: List[np.ndarray] = []
+            case_absolute_distance: List[np.ndarray] = []
+            case_relative_distance: List[np.ndarray] = []
+            case_window_ends: Optional[np.ndarray] = None
+            case_trajectory_uids: List[str] = []
+
+            for rep in range(cfg.system_replicates):
+                A, Q, eigenvalues, _normality_error, system_seed = systems_by_spectrum[spectrum_name][rep]
+
+                for state_idx in range(cfg.initial_states_per_system):
+                    # Intentionally independent of spectrum/profile: paired state signs/tail coefficients.
+                    state_seed = cfg.seed + 10_000_000 * rep + state_idx
+                    trajectory_row, event_rows, traces = analyse_one_trajectory_time_resolved(
+                        cfg=cfg,
+                        estimator_cfg=estimator_cfg,
+                        spectrum_name=spectrum_name,
+                        excitation_name=excitation_name,
+                        excitation_profile=excitation_profile,
+                        A=A,
+                        true_basis=Q,
+                        eigenvalues=eigenvalues,
+                        system_replicate=rep,
+                        system_seed=system_seed,
+                        state_index=state_idx,
+                        state_seed=state_seed,
+                        verify_acceptance=not acceptance_verified_once,
+                    )
+                    acceptance_verified_once = True
+
+                    all_trajectory_rows.append(trajectory_row)
+                    all_event_rows.extend(event_rows)
+                    case_trajectory_uids.append(str(trajectory_row["trajectory_uid"]))
+                    case_accepted.append(traces["accepted"])
+                    case_errors.append(traces["errors_deg"])
+                    case_accepted_correct.append(traces["accepted_correct"])
+                    case_absolute_distance.append(traces["absolute_distance"])
+                    case_relative_distance.append(traces["relative_distance"])
+                    if case_window_ends is None:
+                        case_window_ends = traces["window_end"].copy()
+                    elif not np.array_equal(case_window_ends, traces["window_end"]):
+                        raise RuntimeError("Window indexing changed within a case.")
+
+                    completed_total += 1
+
+                print(
+                    f"  completed system {rep+1}/{cfg.system_replicates}; "
+                    f"case trajectories {(rep+1)*cfg.initial_states_per_system}/{trajectories_per_case}; "
+                    f"overall {completed_total}/{total_trajectories}"
+                )
+
+            if len(case_accepted) != trajectories_per_case:
+                raise RuntimeError(
+                    f"Case {case_name} produced {len(case_accepted)} trajectories; "
+                    f"expected {trajectories_per_case}."
+                )
+            accepted_arr = np.stack(case_accepted, axis=0).astype(np.uint8)
+            errors_arr = np.stack(case_errors, axis=0).astype(np.float32)
+            accepted_correct_arr = np.stack(case_accepted_correct, axis=0).astype(np.uint8)
+            absolute_distance_arr = np.stack(case_absolute_distance, axis=0).astype(np.float64)
+            relative_distance_arr = np.stack(case_relative_distance, axis=0).astype(np.float64)
+            if case_window_ends is None:
+                raise RuntimeError("Case produced no trajectories.")
+
+            time_summary_case = summarize_time_case(
+                spectrum_name=spectrum_name,
+                excitation_name=excitation_name,
+                window_ends=case_window_ends,
+                accepted=accepted_arr,
+                errors=errors_arr,
+                accepted_correct=accepted_correct_arr,
+                relative_distance=relative_distance_arr,
+            )
+            all_time_summary.append(time_summary_case)
+
+            if cfg.save_trace_npz:
+                np.savez_compressed(
+                    traces_dir / f"{case_name}.npz",
+                    window_end=case_window_ends,
+                    accepted=accepted_arr,
+                    errors_deg=errors_arr,
+                    accepted_correct=accepted_correct_arr,
+                    absolute_distance=absolute_distance_arr,
+                    relative_distance=relative_distance_arr,
+                    trajectory_uid=np.asarray(case_trajectory_uids, dtype=str),
+                )
+
+    trajectories = pd.DataFrame(all_trajectory_rows)
+    events = pd.DataFrame(all_event_rows)
+    systems = pd.DataFrame(all_system_rows)
+    time_summary = pd.concat(all_time_summary, ignore_index=True)
 
     trajectories.to_csv(output / "all_trajectories.csv", index=False)
-    stage_results.to_csv(output / "all_stage_results.csv", index=False)
+    events.to_csv(output / "trajectory_stage_recovery_events.csv", index=False)
     systems.to_csv(output / "systems.csv", index=False)
+    time_summary.to_csv(output / "time_resolved_summary.csv", index=False)
 
-    summary = summarize_by_stage(stage_results, cfg)
-    propagation = build_propagation_summary(stage_results, cfg)
-    reference = build_reference_comparison(stage_results)
-    design = build_design_table(cfg)
+    case_stage_summary = summarize_case_stage(events, cfg)
+    case_stage_summary.to_csv(output / "table2_case_stage_recovery_summary.csv", index=False)
 
-    summary.to_csv(output / "table2_stagewise_results.csv", index=False)
-    propagation.to_csv(output / "table3_propagation_results.csv", index=False)
-    reference.to_csv(output / "table4_reference_vs_estimated_deflation.csv", index=False)
-    design.to_csv(output / "table1_experiment_design.csv", index=False)
-
-    plot_stage_rates(summary, output / "01_stagewise_outcome_rates.png")
-    plot_propagation(propagation, output / "02_error_propagation.png")
-    plot_reference_penalty(reference, output / "03_reference_vs_estimated_deflation_penalty.png")
-    plot_error_distribution(stage_results, cfg, output / "04_accepted_angle_error_distribution.png")
-
-    print("\n=== Stage-wise results ===")
-    print(summary[[
-        "stage", "n_accepted", "acceptance_rate", "overall_recovery_rate",
-        "reliability_given_accepted_rate", "false_acceptance_rate",
-        "median_q_i_error_deg_accepted",
-    ]].to_string(index=False))
-
-    print("\n=== Propagation test ===")
-    print(propagation[[
-        "stage", "preceding_chain_condition", "n_trajectories",
-        "stage_i_correct_rate", "stage_i_correct_ci95_low", "stage_i_correct_ci95_high",
-        "reference_correct_rate_same_window",
-        "median_estimated_minus_reference_error_penalty_deg",
-    ]].to_string(index=False))
-
-    empty_incorrect = propagation.loc[
-        (propagation["preceding_chain_condition"] == "any_prior_incorrect")
-        & (propagation["n_trajectories"] == 0)
+    # Compact tables focused on the two new questions: when recovery occurs and
+    # how close to the limit the orbit is at that time.
+    time_cols = [
+        "spectrum_case", "excitation_case", "case_name", "stage", "target",
+        "sustained_recovery_rate", "sustained_recovery_ci95_low", "sustained_recovery_ci95_high",
+        "median_sustained_recovery_start_window_end",
+        "q25_sustained_recovery_start_window_end",
+        "q75_sustained_recovery_start_window_end",
+        "median_sustained_recovery_confirm_window_end",
+        "median_theoretical_full_dominance_time",
+        "median_sustained_minus_theoretical_full_time",
     ]
-    if len(empty_incorrect):
-        stages = ", ".join("q%d" % int(v) for v in empty_incorrect["stage"])
-        print(
-            "\nNOTE: No accepted chains with preceding errors were observed for: " + stages + "."
-        )
-        print(
-            "That is a valid result; do not manufacture propagation errors. "
-            "If needed later, a separate prespecified stress condition can be added."
+    case_stage_summary[time_cols].to_csv(
+        output / "table3_recovery_iteration_summary.csv", index=False
+    )
+
+    distance_cols = [
+        "spectrum_case", "excitation_case", "case_name", "stage", "target",
+        "sustained_recovery_rate",
+        "median_absolute_distance_at_sustained_start",
+        "median_relative_distance_at_sustained_start",
+        "median_log10_relative_distance_at_sustained_start",
+        "q25_log10_relative_distance_at_sustained_start",
+        "q75_log10_relative_distance_at_sustained_start",
+        "median_reference_error_at_sustained_start_deg",
+        "median_estimated_minus_reference_penalty_at_sustained_start_deg",
+    ]
+    case_stage_summary[distance_cols].to_csv(
+        output / "table4_distance_to_limit_at_recovery.csv", index=False
+    )
+
+    plot_case_stage_heatmap(
+        case_stage_summary,
+        "sustained_recovery_rate",
+        "Experiment 3: sustained recovery rate across spectrum/excitation cases",
+        "sustained recovery rate",
+        output / "01_sustained_recovery_rate_heatmap.png",
+        fmt=".2f",
+    )
+    plot_case_stage_heatmap(
+        case_stage_summary,
+        "median_sustained_recovery_start_window_end",
+        "Experiment 3: iteration of first sustained recovery",
+        "median window-end iteration",
+        output / "02_median_sustained_recovery_iteration_heatmap.png",
+        fmt=".0f",
+    )
+    plot_case_stage_heatmap(
+        case_stage_summary,
+        "median_log10_relative_distance_at_sustained_start",
+        "Experiment 3: closeness to limit at first sustained recovery",
+        r"median log10(||x_t-L|| / ||x_0-L||)",
+        output / "03_distance_to_limit_at_sustained_recovery_heatmap.png",
+        fmt=".2f",
+    )
+
+    for case_name in design["case_name"]:
+        plot_time_curves_for_case(
+            time_summary, case_name, curves_dir, cfg.recovery_tolerance_deg
         )
 
+    print("\n=== Compact case-stage summary ===")
+    display_cols = [
+        "spectrum_case", "excitation_case", "stage",
+        "sustained_recovery_rate",
+        "median_sustained_recovery_start_window_end",
+        "median_log10_relative_distance_at_sustained_start",
+        "median_latest_accepted_error_deg",
+    ]
+    print(case_stage_summary[display_cols].to_string(index=False))
     print("\nResults written to:", output.resolve())
+    print("Trajectories per case:", trajectories_per_case)
+    print("Total trajectories:", len(trajectories))
+    print("Expected total trajectories:", total_trajectories)
+    if len(trajectories) != total_trajectories:
+        raise RuntimeError("Unexpected total trajectory count.")
 
 
 if __name__ == "__main__":
