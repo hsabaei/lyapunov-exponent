@@ -366,10 +366,30 @@ def plot_alpha0_negative_control(summary, output):
 
 
 def write_markdown(df, path, title):
+    """Write a simple Markdown table without requiring pandas/tabulate."""
+    display = df.copy()
+
+    def format_value(value):
+        if pd.isna(value):
+            return "N/A"
+        if isinstance(value, (float, np.floating)):
+            return f"{float(value):.6g}"
+        return str(value)
+
+    columns = [str(c) for c in display.columns]
+
     with path.open("w", encoding="utf-8") as f:
         f.write(f"# {title}\n\n")
-        f.write(df.to_markdown(index=False))
-        f.write("\n")
+        f.write("| " + " | ".join(columns) + " |\n")
+        f.write("| " + " | ".join(["---"] * len(columns)) + " |\n")
+
+        for _, row in display.iterrows():
+            values = []
+            for col in display.columns:
+                value = format_value(row[col])
+                value = value.replace("|", "\\|").replace("\n", " ")
+                values.append(value)
+            f.write("| " + " | ".join(values) + " |\n")
 
 
 def main():
