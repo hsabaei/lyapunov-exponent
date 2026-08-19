@@ -139,6 +139,16 @@ def normalize_structure(value: object) -> str:
     return aliases.get(lowered, lowered)
 
 
+def parse_stage_value(value: object) -> int:
+    if pd.isna(value):
+        raise ValueError("Missing stage/filter index.")
+    text = str(value).strip().lower()
+    match = re.search(r"(\d+)", text)
+    if match:
+        return int(match.group(1))
+    raise ValueError(f"Could not parse stage/filter index from {value!r}.")
+
+
 def infer_beta(row: pd.Series, beta_col: str | None, case_col: str | None, default: float | None) -> float:
     if beta_col and pd.notna(row.get(beta_col)):
         return float(row[beta_col])
@@ -147,30 +157,128 @@ def infer_beta(row: pd.Series, beta_col: str | None, case_col: str | None, defau
         match = re.search(r"beta[_=]?([0-9]+(?:\.[0-9]+)?)", text)
         if match:
             return float(match.group(1))
+    for value in row.values:
+        text = str(value)
+        match = re.search(r"beta[_=]?([0-9]+(?:\.[0-9]+)?)", text)
+        if match:
+            return float(match.group(1))
     if default is not None:
         return float(default)
     return math.nan
 
 
+def infer_structure_series(df: pd.DataFrame) -> pd.Series:
+    structure_col = find_column(
+        df,
+        [
+            "structure",
+            "structure_name",
+            "structure_label",
+            "nonlinear_structure",
+            "system_type",
+            "case_structure",
+            "case_type",
+            "family",
+            "scenario",
+            "setting",
+            "experiment_case",
+            "experiment_condition",
+        ],
+    )
+    case_col = find_column(
+        df,
+        [
+            "case",
+            "case_id",
+            "case_name",
+            "case_key",
+            "condition",
+            "condition_id",
+            "configuration",
+            "config",
+        ],
+    )
+
+    if structure_col:
+        return df[structure_col].map(normalize_structure)
+    if case_col:
+        return df[case_col].map(normalize_structure)
+
+    # Last resort: scan text-valued columns for embedded case names such as
+    # "rotation_pair__beta_0.5". This keeps the reporter usable across small
+    # schema changes in the experiment runner.
+    text_cols = [
+        c
+        for c in df.columns
+        if pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_string_dtype(df[c])
+    ]
+    inferred = pd.Series([None] * len(df), index=df.index, dtype=object)
+    known_tokens = tuple(STRUCTURE_LABELS)
+    alias_tokens = {
+        "non_normal_real": "nonnormal_real",
+        "nonnormal": "nonnormal_real",
+        "rotation": "rotation_pair",
+        "equal_magnitude": "equal_magnitude_pair",
+        "normal": "normal_real",
+    }
+    for col in text_cols:
+        values = df[col].astype(str)
+        for idx, value in values.items():
+            if inferred.at[idx] is not None:
+                continue
+            lowered = value.lower().replace("-", "_").replace(" ", "_")
+            for token in known_tokens:
+                if token in lowered:
+                    inferred.at[idx] = token
+                    break
+            if inferred.at[idx] is not None:
+                continue
+            for alias, canonical in alias_tokens.items():
+                if alias in lowered:
+                    inferred.at[idx] = canonical
+                    break
+
+    if inferred.notna().all():
+        return inferred
+
+    raise KeyError(
+        "Could not infer structure column from events file. "
+        f"Available columns are: {list(df.columns)}. "
+        "Expected a structure/case column or text values containing one of "
+        f"{list(STRUCTURE_LABELS)}."
+    )
+
+
 def normalize_events(df: pd.DataFrame, source: str, default_beta: float | None = None) -> pd.DataFrame:
     df = df.copy()
-    case_col = find_column(df, ["case", "case_id", "condition"])
-    structure_col = find_column(df, ["structure", "nonlinear_structure", "system_type", "case_structure"])
-    stage_col = find_column(df, ["stage", "filter", "filter_index", "k", "target_index"], required=True)
+    case_col = find_column(
+        df,
+        [
+            "case",
+            "case_id",
+            "case_name",
+            "case_key",
+            "condition",
+            "condition_id",
+            "configuration",
+            "config",
+            "experiment_case",
+            "experiment_condition",
+        ],
+    )
+    stage_col = find_column(
+        df,
+        ["stage", "stage_index", "filter", "filter_index", "k", "target_index", "direction", "direction_index"],
+        required=True,
+    )
     beta_col = find_column(df, ["beta", "nonlinear_beta"])
     traj_col = find_column(df, ["trajectory_id", "traj_id", "trajectory", "run_id"])
     system_col = find_column(df, ["system_id", "system", "system_index"])
     state_col = find_column(df, ["state_id", "initial_state_id", "state_index", "ic_id"])
 
-    if structure_col:
-        df["structure"] = df[structure_col].map(normalize_structure)
-    elif case_col:
-        df["structure"] = df[case_col].map(normalize_structure)
-    else:
-        raise KeyError("Could not infer structure column from events file.")
-
+    df["structure"] = infer_structure_series(df)
     df["beta"] = df.apply(lambda r: infer_beta(r, beta_col, case_col, default_beta), axis=1)
-    df["stage"] = df[stage_col].astype(int)
+    df["stage"] = df[stage_col].map(parse_stage_value)
     df["target"] = [
         TARGET_LABELS.get(struct, {}).get(int(stage), f"stage{int(stage)}")
         for struct, stage in zip(df["structure"], df["stage"])
@@ -356,15 +464,23 @@ def table4_jacobian(nonlinear_dir: Path, control_dir: Path, events: pd.DataFrame
         if not p:
             continue
         df = pd.read_csv(p)
-        case_col = find_column(df, ["case", "case_id", "condition"])
-        structure_col = find_column(df, ["structure", "nonlinear_structure", "system_type", "case_structure"])
+        case_col = find_column(
+            df,
+            [
+                "case",
+                "case_id",
+                "case_name",
+                "case_key",
+                "condition",
+                "condition_id",
+                "configuration",
+                "config",
+                "experiment_case",
+                "experiment_condition",
+            ],
+        )
         beta_col = find_column(df, ["beta", "nonlinear_beta"])
-        if structure_col:
-            df["structure"] = df[structure_col].map(normalize_structure)
-        elif case_col:
-            df["structure"] = df[case_col].map(normalize_structure)
-        else:
-            continue
+        df["structure"] = infer_structure_series(df)
         df["beta"] = df.apply(lambda r: infer_beta(r, beta_col, case_col, default_beta), axis=1)
         df["source_run"] = source
         frames.append(df)
