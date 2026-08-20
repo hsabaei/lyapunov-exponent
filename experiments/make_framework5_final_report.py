@@ -149,6 +149,15 @@ def parse_stage_value(value: object) -> int:
     raise ValueError(f"Could not parse stage/filter index from {value!r}.")
 
 
+def parse_bool_series(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return series.fillna(False)
+    if pd.api.types.is_numeric_dtype(series):
+        return series.fillna(0).astype(float).ne(0)
+    text = series.fillna("").astype(str).str.strip().str.lower()
+    return text.isin(["true", "t", "yes", "y", "1"])
+
+
 def infer_beta(row: pd.Series, beta_col: str | None, case_col: str | None, default: float | None) -> float:
     if beta_col and pd.notna(row.get(beta_col)):
         return float(row[beta_col])
@@ -272,7 +281,10 @@ def normalize_events(df: pd.DataFrame, source: str, default_beta: float | None =
         required=True,
     )
     beta_col = find_column(df, ["beta", "nonlinear_beta"])
-    traj_col = find_column(df, ["trajectory_id", "traj_id", "trajectory", "run_id"])
+    traj_col = find_column(
+        df,
+        ["trajectory_id", "traj_id", "trajectory", "trajectory_uid", "run_id"],
+    )
     system_col = find_column(df, ["system_id", "system", "system_index"])
     state_col = find_column(df, ["state_id", "initial_state_id", "state_index", "ic_id"])
 
@@ -294,21 +306,62 @@ def normalize_events(df: pd.DataFrame, source: str, default_beta: float | None =
         df["trajectory_key"] = np.arange(len(df)).astype(str)
 
     for canonical, candidates in {
-        "accepted": ["accepted", "is_accepted", "A_k", "accepted_latest", "latest_accepted"],
-        "correct": ["correct", "is_correct", "C_k", "primary_correct", "latest_correct"],
-        "ever_recovered": ["ever_recovered", "ever_recover", "ever_correct", "ever_primary_correct"],
-        "first_recovery": ["first_recovery", "first_recovery_iteration", "t_first", "first_t"],
-        "last_recovery": ["last_recovery", "last_recovery_iteration", "t_last", "last_t"],
-        "primary_error_deg": ["primary_error_deg", "primary_error", "error_deg", "angle_deg"],
+        "accepted": [
+            "accepted",
+            "is_accepted",
+            "A_k",
+            "accepted_latest",
+            "latest_accepted",
+            "ever_accepted",
+        ],
+        "correct": [
+            "correct",
+            "is_correct",
+            "C_k",
+            "primary_correct",
+            "latest_correct",
+            "ever_recovered_primary_target",
+        ],
+        "ever_recovered": [
+            "ever_recovered",
+            "ever_recover",
+            "ever_correct",
+            "ever_primary_correct",
+            "ever_recovered_primary_target",
+        ],
+        "first_recovery": [
+            "first_recovery",
+            "first_recovery_iteration",
+            "first_recovery_window_end",
+            "t_first",
+            "first_t",
+        ],
+        "last_recovery": [
+            "last_recovery",
+            "last_recovery_iteration",
+            "last_recovery_window_end",
+            "t_last",
+            "last_t",
+        ],
+        "primary_error_deg": [
+            "primary_error_deg",
+            "primary_error",
+            "latest_accepted_primary_error_deg",
+            "first_recovery_primary_error_deg",
+            "error_deg",
+            "angle_deg",
+        ],
         "distance_log10_first": [
             "log10_distance_to_limit_at_first_recovery",
             "log10_relative_distance_at_first_recovery",
+            "first_recovery_log10_relative_distance",
             "distance_log10_first",
             "log10_distance_ratio_first",
         ],
         "jacobian_deviation_first": [
             "jacobian_deviation_at_first_recovery",
             "relative_jacobian_deviation_at_first_recovery",
+            "first_recovery_jacobian_relative_difference",
             "jacobian_rel_error_first",
             "j_rel_first",
         ],
@@ -329,7 +382,7 @@ def normalize_events(df: pd.DataFrame, source: str, default_beta: float | None =
             df["ever_recovered"] = df["correct"]
 
     for col in ["accepted", "correct", "ever_recovered"]:
-        df[col] = df[col].fillna(False).astype(bool)
+        df[col] = parse_bool_series(df[col])
     for col in [
         "first_recovery",
         "last_recovery",
